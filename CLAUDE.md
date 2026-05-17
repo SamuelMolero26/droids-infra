@@ -24,7 +24,7 @@ E2E tests live in `cmd/droids-mem/e2e_test.go` — invoke the built CLI end-to-e
 
 - `DROIDS_MEM_DB` — DB path. Default `~/.droids-mem/mem.db`. Always set this to a tempfile in tests.
 - DB auto-creates parent dir (`0o700`) and applies pragmas: WAL, foreign_keys=ON, synchronous=NORMAL.
-- Schema + 3 FTS sync triggers + `updated_at` trigger applied on every `Open()` (idempotent via `IF NOT EXISTS`).
+- Schema + 3 FTS sync triggers applied on every `Open()` (idempotent via `IF NOT EXISTS`). `updated_at >= created_at` enforced via CHECK constraint, not a trigger.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ Three-layer pipeline. Don't bypass layers:
 - FTS sync is via 3 triggers (AI/AD/AU). Direct writes to `memories_fts` (other than `'delete'` command rows) are bugs.
 - FTS returns `rowid`; bridge to `memories.id` (TEXT, ULID with `mem_`/`sess_` prefix). Callers never see rowid.
 - `tags` stored as space-delimited string (NOT JSON) — FTS5 tokenizes on whitespace.
-- `updated_at = created_at` on insert via trigger. Only mutated on `force=true` overwrite. Never `DEFAULT 0` (breaks recency tiebreaks).
+- `updated_at = created_at` set in code on insert (`save.go`). Only mutated on `force=true` overwrite. Never `DEFAULT 0` (breaks recency tiebreaks). CHECK constraint guards `updated_at >= created_at` at DB layer.
 
 ### Dedupe (`save`)
 
