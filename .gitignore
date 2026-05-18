@@ -1,0 +1,7 @@
+# compiled Go binaries
+droids-mem/droids-mem
+droids-mem/droids-mem-mcp
+
+# Go test / build artifacts
+*.test
+*.out
