@@ -7,9 +7,17 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  lint-test:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: droids-mem
@@ -22,6 +30,7 @@ jobs:
         with:
           go-version-file: droids-mem/go.mod
           cache: true
+          cache-dependency-path: droids-mem/go.sum
 
       - name: Go fmt
         run: |
@@ -34,6 +43,23 @@ jobs:
 
       - name: Go vet
         run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: droids-mem
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: droids-mem/go.mod
+          cache: true
+          cache-dependency-path: droids-mem/go.sum
 
       - name: Go test
         run: go test ./...
