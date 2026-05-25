@@ -83,3 +83,10 @@ bin/
 *.temp
 ~*
 
+# Markdown docs and notes
+**/*.md
+!CLAUDE.md
+!**/CLAUDE.md
+!CONTEXT.md
+!**/CONTEXT.md
+

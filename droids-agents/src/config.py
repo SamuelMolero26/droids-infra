@@ -28,6 +28,21 @@ def _require(key: str) -> str:
     return val
 
 
+def _droids_mem_token() -> str:
+    """Token precedence: DROIDS_MEM_MCP_TOKEN env → ~/.droids-mem/token file."""
+    val = os.environ.get("DROIDS_MEM_MCP_TOKEN", "").strip()
+    if val:
+        return val
+    token_file = Path.home() / ".droids-mem" / "token"
+    if token_file.exists():
+        tok = token_file.read_text().strip()
+        if tok:
+            return tok
+    raise SettingsError(
+        "droids-mem token not found: set DROIDS_MEM_MCP_TOKEN or run `droids-mem ensure-server` first"
+    )
+
+
 def _parse_allowlist(raw: str) -> tuple[str, ...]:
     return tuple(d.strip().lower() for d in raw.split(",") if d.strip())
 
@@ -72,7 +87,7 @@ class Settings:
 
         return cls(
             anthropic_api_key=_require("ANTHROPIC_API_KEY"),
-            droids_mem_mcp_token=_require("DROIDS_MEM_MCP_TOKEN"),
+            droids_mem_mcp_token=_droids_mem_token(),
             droids_mem_mcp_url=os.environ.get(
                 "DROIDS_MEM_MCP_URL", "http://localhost:7777/mcp"
             ),

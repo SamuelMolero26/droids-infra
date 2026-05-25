@@ -27,10 +27,13 @@ def settings(tmp_path) -> Settings:
 
 
 class _MockResp:
-    def __init__(self, status_code: int, body: dict | str) -> None:
+    def __init__(
+        self, status_code: int, body: dict | str, headers: dict | None = None
+    ) -> None:
         self.status_code = status_code
         self._body = body
         self.text = body if isinstance(body, str) else json.dumps(body)
+        self.headers = headers or {}
 
     def json(self) -> dict:
         if isinstance(self._body, str):
@@ -38,9 +41,19 @@ class _MockResp:
         return self._body
 
 
+# Default response to the MCP `initialize` handshake: 200 + Mcp-Session-Id header.
+def _init_resp() -> _MockResp:
+    return _MockResp(200, {"jsonrpc": "2.0", "id": 1, "result": {}},
+                     headers={"Mcp-Session-Id": "mcp_sess_test"})
+
+
 class _MockClient:
-    def __init__(self, resp: _MockResp) -> None:
-        self._resp = resp
+    """Routes the 3-POST Streamable HTTP handshake by JSON-RPC method:
+    initialize -> session header, notifications/initialized -> dummy,
+    tools/call -> the test-configured response."""
+
+    def __init__(self, call_resp: _MockResp) -> None:
+        self._call_resp = call_resp
         self.last_call = None
 
     def __enter__(self) -> "_MockClient":
@@ -51,7 +64,12 @@ class _MockClient:
 
     def post(self, url, headers, content):
         self.last_call = {"url": url, "headers": headers, "content": content}
-        return self._resp
+        method = json.loads(content).get("method")
+        if method == "initialize":
+            return _init_resp()
+        if method == "notifications/initialized":
+            return _MockResp(202, {})
+        return self._call_resp  # tools/call
 
 
 def _patch_client(monkeypatch, resp: _MockResp) -> _MockClient:

@@ -39,17 +39,18 @@ from droids_agents.display import (
     print_session_header,
     render_agent_display,
 )
+from droids_agents.execution import (
+    ExecutionError,
+    MemUnreachable,
+    build_execution,
+    interpret_result,
+    plan_execution,
+)
 from droids_agents.naming import NamePool
 from droids_agents.pricing import usd_to_max_total_tokens
-from droids_agents.router import build_root, classify_prompt, plan_mixed_steps
+from droids_agents.router import make_client
 from droids_agents.runtime import connect_runtime
-from droids_agents.schemas import (
-    ClassifierLabel,
-    label_to_task_type,
-)
-from droids_agents.slicing import slice_for
 from droids_agents.tools.gmail import GMAIL_SCOPES
-from droids_agents.tools.mem import MemFetchError, fetch_mem_context
 
 _DOCS_TOTAL_CAP_BYTES: int = 5 * 1024 * 1024
 _ALLOWED_DOC_EXTS: frozenset[str] = frozenset({".pdf", ".md", ".txt"})
@@ -107,58 +108,6 @@ def _validate_docs(raw_paths: tuple[str, ...]) -> list[tuple[Path, str]]:
             )
         out.append((p, basename))
     return out
-
-
-def _resolve_steps(
-    *,
-    settings: Settings,
-    prompt: str,
-    task_type_override: str | None,
-) -> list[ClassifierLabel]:
-    """Run classifier (and mixed_planner if needed). Honors --task-type."""
-    if task_type_override:
-        # Reverse map: task_type → label. Used to short-circuit the classifier
-        # so a known task_type bypasses the LLM.
-        for label, tt in _LABEL_TO_TT.items():
-            if tt == task_type_override:
-                return [label]
-        raise click.UsageError(
-            f"--task-type {task_type_override!r} is not a valid TaskType"
-        )
-
-    label = classify_prompt(prompt, settings=settings)
-    if label != "mixed":
-        return [label]
-    return plan_mixed_steps(prompt, settings=settings)
-
-
-# Lazy reverse map to avoid a circular import at top level.
-from droids_agents.schemas import LABEL_TO_TASK_TYPE as _LABEL_TO_TT  # noqa: E402
-
-
-def _build_slice_map(*, bundle, prompt: str, steps: list[ClassifierLabel]) -> dict[str, list[str]]:
-    """Map role → sliced lines for every Sub-agent role that this Execution uses."""
-    roles_for_label = {
-        "research": ("competitor",),
-        "docs": ("extractor", "synthesizer"),
-        "form": ("form_planner", "form_executor"),
-        "messaging": ("drafter", "sender"),
-    }
-    needed: set[str] = set()
-    for s in steps:
-        for r in roles_for_label.get(s, ()):
-            needed.add(r)
-    return {role: slice_for(role, bundle, prompt) for role in needed}
-
-
-def _result_get(result: Any, *names: str, default: Any = None) -> Any:
-    """Tolerate either object-attr or dict-key shapes from agentspan results."""
-    for n in names:
-        if hasattr(result, n):
-            return getattr(result, n)
-        if isinstance(result, dict) and n in result:
-            return result[n]
-    return default
 
 
 # --- main group ----------------------------------------------------------
@@ -229,66 +178,53 @@ def run(
     docs_basenames = [b for _, b in docs_validated]
     competitor_list = [c.strip() for c in competitors.split(",") if c.strip()]
 
-    # Pre-classify before agentspan compile.
-    steps = _resolve_steps(
-        settings=settings, prompt=prompt_text, task_type_override=task_type
-    )
-    task_type_final = label_to_task_type(steps[0])
-
-    if "messaging" in steps and not settings.gmail_enabled:
-        _emit_err(
-            console,
-            "gmail_not_configured",
-            "this prompt needs the messaging Subteam but Gmail is not configured. "
-            "Set GOOGLE_CREDENTIALS_JSON + GOOGLE_TOKEN_JSON and run "
-            "`droids-agents auth gmail`, or rephrase to avoid email tasks.",
-        )
-        sys.exit(2)
-
-    # Direct mem_context fetch (V1 deviation — see tools/mem.py for rationale).
-    try:
-        mem_result = fetch_mem_context(
-            settings, task_type=task_type_final, query=prompt_text
-        )
-    except MemFetchError as e:
-        _emit_err(console, "mem_unreachable", str(e))
-        sys.exit(3)
-
-    sess_id = session_id or mem_result.session_id
-    dlog.bind_session(sess_id)
-    _log.info(
-        "session_resolved",
-        session_id=sess_id,
-        task_type=task_type_final,
-        steps=steps,
-    )
-
-    slice_map = _build_slice_map(
-        bundle=mem_result.bundle, prompt=prompt_text, steps=steps
-    )
-
+    client = make_client(settings)
     pool = NamePool(names=None)  # OS-entropy seeded → random per Execution
     max_total_tokens = (
         usd_to_max_total_tokens(max_cost_usd) if max_cost_usd is not None else None
     )
 
-    root = build_root(
-        settings,
-        pool=pool,
-        prompt=prompt_text,
-        steps=steps,
+    # Decision + assembly are surface-independent (see execution.py). Each
+    # ExecutionError subclass maps to a stable CLI exit code.
+    try:
+        plan = plan_execution(
+            settings=settings,
+            client=client,
+            prompt=prompt_text,
+            competitors=competitor_list,
+            task_type_override=task_type,
+        )
+        prepared = build_execution(
+            settings=settings,
+            plan=plan,
+            prompt=prompt_text,
+            pool=pool,
+            docs_basenames=docs_basenames,
+            session_id_override=session_id,
+            max_total_tokens=max_total_tokens,
+        )
+    except MemUnreachable as e:
+        _emit_err(console, e.code, e.message)
+        sys.exit(3)
+    except ExecutionError as e:
+        _emit_err(console, e.code, e.message)
+        sys.exit(2)
+
+    sess_id = prepared.session_id
+    task_type_final = plan.task_type
+    dlog.bind_session(sess_id)
+    _log.info(
+        "session_resolved",
         session_id=sess_id,
-        competitors=competitor_list,
-        docs_basenames=docs_basenames,
-        slice_map=slice_map,
-        max_total_tokens=max_total_tokens,
+        task_type=task_type_final,
+        steps=plan.steps,
     )
 
     runtime = connect_runtime(settings)
 
     try:
         result = runtime.run(  # type: ignore[attr-defined]
-            root,
+            prepared.root,
             prompt_text,
             context={
                 "task_type_override": task_type,
@@ -308,56 +244,44 @@ def run(
         _emit_err(console, "runtime_error", str(e))
         sys.exit(1)
 
-    exec_id = _result_get(result, "execution_id", "exec_id", default="<unknown>")
-    print_execution_header(console, exec_id=exec_id, task_type_override=task_type)
+    outcome = interpret_result(result, dry_run=dry_run)
+    print_execution_header(console, exec_id=outcome.exec_id, task_type_override=task_type)
     print_session_header(console, session_id=sess_id, task_type=task_type_final)
 
-    # HITL pause surfacing.
-    if _result_get(result, "is_waiting", default=False):
-        pending = _result_get(result, "pending_approval", "waiting_for", default={})
-        if not isinstance(pending, dict):
-            pending = {}
-        meta = pending.get("metadata") or {}
+    if outcome.kind == "hitl":
+        meta = outcome.hitl.get("metadata") or {}
         print_hitl_pause(
             console,
             droid_name=meta.get("droid_name", "?"),
             role_label=meta.get("role_label", meta.get("role", "?")),
-            tool_name=pending.get("tool_name", "?"),
-            tool_args=pending.get("tool_args", {}) or {},
+            tool_name=outcome.hitl.get("tool_name", "?"),
+            tool_args=outcome.hitl.get("tool_args", {}) or {},
             session_id=sess_id,
-            exec_id=exec_id,
+            exec_id=outcome.exec_id,
             ui_base_url=settings.agentspan_url,
-            reason=pending.get("reason"),
+            reason=outcome.hitl.get("reason"),
         )
         sys.exit(4)
 
-    if dry_run:
-        payload = _result_get(result, "output", default={})
-        # Pydantic / dict-safe dump
-        if hasattr(payload, "model_dump"):
-            payload = payload.model_dump()
-        console.print(json.dumps({"status": "dry_run_pass", "output": payload}, default=str))
+    if outcome.kind == "dry_run":
+        console.print(
+            json.dumps({"status": "dry_run_pass", "output": outcome.output}, default=str)
+        )
         sys.exit(10)
 
-    # Success path. Cost cap detection: if termination fired on token usage,
-    # agentspan typically marks the result. Heuristic — surface in log.
-    termination_reason = _result_get(result, "termination_reason", default="")
-    if "token" in str(termination_reason).lower():
+    if outcome.kind == "cost_cap":
         _emit_err(
             console,
             "cost_cap_hit",
-            f"TokenUsageTermination fired: {termination_reason}",
+            f"TokenUsageTermination fired: {outcome.termination_reason}",
         )
         sys.exit(5)
 
-    output = _result_get(result, "output", default={})
-    if hasattr(output, "model_dump"):
-        output = output.model_dump()
     if json_mode:
-        console.print(json.dumps({"status": "ok", "output": output}, default=str))
+        console.print(json.dumps({"status": "ok", "output": outcome.output}, default=str))
     else:
         console.print("[bold green]done[/]")
-        console.print(output)
+        console.print(outcome.output)
     sys.exit(0)
 
 

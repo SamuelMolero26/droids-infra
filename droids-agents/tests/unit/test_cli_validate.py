@@ -1,4 +1,4 @@
-"""CLI helpers: --docs validation, --task-type → label resolution."""
+"""CLI helpers: --docs validation."""
 
 from __future__ import annotations
 
@@ -45,24 +45,3 @@ def test_validate_docs_rejects_total_size_cap(tmp_path) -> None:
     big = _make_file(tmp_path / "big.txt", b"\0" * (6 * 1024 * 1024))
     with pytest.raises(click.UsageError, match="total size"):
         cli._validate_docs((big,))
-
-
-def test_resolve_steps_with_task_type_short_circuits(monkeypatch) -> None:
-    """--task-type override skips the classifier LLM call."""
-    called = {"n": 0}
-
-    def _fail(*a, **kw):
-        called["n"] += 1
-        raise AssertionError("classifier must not run when --task-type is set")
-
-    monkeypatch.setattr(cli, "classify_prompt", _fail)
-    monkeypatch.setattr(cli, "plan_mixed_steps", _fail)
-
-    out = cli._resolve_steps(settings=None, prompt="x", task_type_override="doc_synthesis")
-    assert out == ["docs"]
-    assert called["n"] == 0
-
-
-def test_resolve_steps_rejects_unknown_task_type() -> None:
-    with pytest.raises(click.UsageError):
-        cli._resolve_steps(settings=None, prompt="x", task_type_override="weird")

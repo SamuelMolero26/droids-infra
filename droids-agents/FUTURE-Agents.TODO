@@ -67,8 +67,7 @@ Possible interventions: per-worker agentspan instance with `pytest-xdist`, or a 
 
 # To Consider:
 [ ] SMS first time
-[ ] 12 hours / CMS you need to include the login
-
+[ ] ALlow for a second agents once one is done / while one is finished
 
 [ ] Allow for local models plugin
 [ ] Multi model ability 

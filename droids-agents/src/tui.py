@@ -23,36 +23,64 @@ event loop. The click-mounted entrypoint is in ``cli.py``.
 from __future__ import annotations
 
 import asyncio
-import threading
-import traceback
-from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Any
+import os
+import shutil
+import subprocess
+from pathlib import Path
 
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.reactive import reactive
-from textual.screen import Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    RichLog,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 import httpx
 
+from droids_agents import memquery, sessions
 from droids_agents.config import Settings
-from droids_agents.display import color_for_droid, color_for_role
-from droids_agents.naming import NamePool
+from droids_agents.memquery import MemQueryError, Memory, Session
 from droids_agents.pricing import usd_to_max_total_tokens
-from droids_agents.router import build_root, classify_prompt, plan_mixed_steps
-from droids_agents.runtime import connect_runtime
-from droids_agents.schemas import label_to_task_type, LABEL_TO_TASK_TYPE
-from droids_agents.slicing import slice_for
-from droids_agents.tools.mem import MemFetchError, fetch_mem_context
+from droids_agents.sessions import RegistryFull, SessionRegistry, SessionState
+
+
+def _ensure_droids_mem() -> tuple[bool, str]:
+    """Best-effort ensure-server call. Returns (ok, detail)."""
+    gopath_bin = Path(os.environ.get("GOPATH", "")).expanduser() / "bin" / "droids-mem"
+    binary = (
+        shutil.which("droids-mem")
+        or (str(gopath_bin) if gopath_bin.exists() else None)
+        or str(Path.home() / "go" / "bin" / "droids-mem")
+    )
+    if not Path(binary).exists():
+        return False, f"binary not found at {binary}"
+    try:
+        result = subprocess.run(
+            [binary, "ensure-server"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, result.stdout.strip()
+        return False, result.stderr.strip() or f"exit {result.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
 
 
 def _ping_mem(settings: Settings) -> tuple[bool, str]:
-    """Best-effort GET on droids-mem-mcp /healthz. Returns (ok, detail)."""
+    """Best-effort GET on droids-mem /healthz. Returns (ok, detail)."""
     healthz = settings.droids_mem_mcp_url.rsplit("/mcp", 1)[0].rstrip("/") + "/healthz"
     try:
         r = httpx.get(healthz, timeout=2.0)
@@ -76,38 +104,17 @@ def _ping_agentspan(settings: Settings) -> tuple[bool, str]:
 _POLL_INTERVAL_S: float = 1.0
 
 
-@dataclass
-class _RunState:
-    """Owned by the worker thread; mutated under ``lock`` only."""
-
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    status: str = "preparing"
-    exec_id: str = ""
-    session_id: str = ""
-    task_type: str = ""
-    steps: list[str] = field(default_factory=list)
-    agents: list[dict[str, str]] = field(default_factory=list)
-    events: list[str] = field(default_factory=list)
-    hitl: dict[str, Any] | None = None
-    error: str | None = None
-    final_output: Any = None
-
-    def event(self, line: str) -> None:
-        with self.lock:
-            self.events.append(line)
+def _load_logo() -> str:
+    """ASCII logo for the prompt screen. Falls back to a plain title."""
+    try:
+        return (Path(__file__).parent / "assets" / "logo.txt").read_text(
+            encoding="utf-8"
+        ).rstrip("\n")
+    except OSError:
+        return "droids-agents"
 
 
-def _roles_for(steps: list[str]) -> list[str]:
-    mapping = {
-        "research": ["competitor"],
-        "docs": ["extractor", "synthesizer"],
-        "form": ["form_planner", "form_executor"],
-        "messaging": ["drafter", "sender"],
-    }
-    out: list[str] = []
-    for s in steps:
-        out.extend(mapping.get(s, []))
-    return out
+_LOGO = _load_logo()
 
 
 # --- Prompt screen --------------------------------------------------------
@@ -116,11 +123,18 @@ def _roles_for(steps: list[str]) -> list[str]:
 class PromptScreen(Screen):
     """First screen: enter prompt + optional flags, click Run."""
 
-    BINDINGS = [Binding("ctrl+c", "app.quit", "Quit")]
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit"),
+        Binding("ctrl+p", "browse_sessions", "Sessions"),
+    ]
+
+    def action_browse_sessions(self) -> None:
+        self.app.push_screen(SessionBrowserScreen())
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical(id="prompt-container"):
+            yield Static(Text(_LOGO, no_wrap=True), id="logo")
             yield Static(
                 "[bold cyan]droids-agents[/]\n"
                 "[dim]Enter a task prompt. Optional comma-separated competitor names.[/]",
@@ -154,294 +168,372 @@ class PromptScreen(Screen):
                 self.notify(f"max-cost-usd not a float: {cost_raw}", severity="error")
                 return
         self.app.push_screen(
-            DashboardScreen(prompt=prompt, competitors_csv=competitors, max_cost_usd=max_cost)
+            SessionsScreen(
+                first_prompt=prompt,
+                first_competitors_csv=competitors,
+                max_cost_usd=max_cost,
+            )
         )
 
 
-# --- Dashboard screen -----------------------------------------------------
+# --- Session browser + search (Phase 1: read-only over droids-mem) --------
 
 
-class DashboardScreen(Screen):
-    """Live dashboard: steps, agent status, event log, HITL pause."""
+def _fmt_ts(epoch: int) -> str:
+    import datetime as _dt
+
+    if not epoch:
+        return "—"
+    return _dt.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
+class SessionBrowserScreen(Screen):
+    """Ctrl+P browser: previous sessions saved to droids-mem (image 3)."""
 
     BINDINGS = [
-        Binding("ctrl+c", "app.quit", "Quit"),
         Binding("escape", "app.pop_screen", "Back"),
+        Binding("slash", "search", "Search"),
+        Binding("j", "cursor_down", "Down"),
+        Binding("k", "cursor_up", "Up"),
+        Binding("r", "reload", "Reload"),
     ]
 
-    status: reactive[str] = reactive("preparing")
-
-    def __init__(
-        self,
-        *,
-        prompt: str,
-        competitors_csv: str,
-        max_cost_usd: float | None,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._prompt = prompt
-        self._competitors = [c.strip() for c in competitors_csv.split(",") if c.strip()]
-        self._max_cost_usd = max_cost_usd
-        self._state = _RunState()
-        self._run_thread: threading.Thread | None = None
+        self._sessions: list[Session] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Vertical(id="dash-container"):
-            yield Static(self._prompt_banner(), id="prompt-banner")
-            with Horizontal(id="status-row"):
-                yield Label("status:", id="status-label")
-                yield Static("preparing", id="status-text")
-                yield Label("exec:", id="exec-label")
-                yield Static("…", id="exec-text")
-                yield Label("session:", id="session-label")
-                yield Static("…", id="session-text")
-            yield Static("steps: …", id="steps-text")
-            yield DataTable(id="agent-table", zebra_stripes=True)
-            with VerticalScroll(id="events-pane"):
-                yield RichLog(id="event-log", highlight=True, markup=True, wrap=True)
-            yield Static("", id="hitl-panel")
+        with Vertical(id="browser-container"):
+            yield Static("[bold]Previous sessions[/] — droids-mem", id="browser-title")
+            yield DataTable(id="sessions-table", zebra_stripes=True, cursor_type="row")
+            yield Static(
+                "[dim]j/k navigate • enter detail • / search • r reload • esc back[/]",
+                id="browser-hint",
+            )
         yield Footer()
 
-    def _prompt_banner(self) -> str:
-        comp = ", ".join(self._competitors) if self._competitors else "(none)"
-        return f"[bold]prompt:[/] {self._prompt}\n[dim]competitors:[/] {comp}"
+    def on_mount(self) -> None:
+        tbl = self.query_one("#sessions-table", DataTable)
+        tbl.add_columns("when", "task_type", "title", "mems")
+        self._load()
+
+    def action_reload(self) -> None:
+        self._load()
+
+    @work(thread=True, exclusive=True)
+    def _load(self) -> None:
+        try:
+            sessions = memquery.list_sessions()
+        except MemQueryError as e:
+            self.app.call_from_thread(
+                self.notify, f"droids-mem: {e}", severity="error"
+            )
+            return
+        self.app.call_from_thread(self._populate, sessions)
+
+    def _populate(self, sessions: list[Session]) -> None:
+        self._sessions = sessions
+        tbl = self.query_one("#sessions-table", DataTable)
+        tbl.clear()
+        for s in sessions:
+            tbl.add_row(_fmt_ts(s.created_at), s.task_type or "—", s.title, str(len(s.memories)))
+        tbl.focus()
+        if not sessions:
+            self.notify("no sessions saved yet", severity="information")
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#sessions-table", DataTable).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#sessions-table", DataTable).action_cursor_up()
+
+    def action_search(self) -> None:
+        self.app.push_screen(SearchScreen())
+
+    @on(DataTable.RowSelected, "#sessions-table")
+    def _open(self, event: DataTable.RowSelected) -> None:
+        row = event.cursor_row
+        if 0 <= row < len(self._sessions):
+            self.app.push_screen(SessionDetailScreen(self._sessions[row]))
+
+
+class SessionDetailScreen(Screen):
+    """One session's stored memories (the rollup: summary + patterns/errors/rules)."""
+
+    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
+
+    def __init__(self, session: Session) -> None:
+        super().__init__()
+        self._session = session
+
+    def compose(self) -> ComposeResult:
+        s = self._session
+        yield Header(show_clock=True)
+        with Vertical(id="detail-container"):
+            yield Static(
+                f"[bold]{s.title}[/]\n[dim]{s.task_type} • {s.session_id} • {_fmt_ts(s.created_at)}[/]",
+                id="detail-title",
+            )
+            tbl = DataTable(id="detail-table", zebra_stripes=True, cursor_type="row")
+            yield tbl
+            yield Static("[dim]esc back[/]", id="detail-hint")
+        yield Footer()
 
     def on_mount(self) -> None:
-        tbl = self.query_one("#agent-table", DataTable)
-        tbl.add_columns("droid", "role", "status")
-        self._start_run()
-        self._poll_state()
+        tbl = self.query_one("#detail-table", DataTable)
+        tbl.add_columns("kind", "title", "learned")
+        for m in self._session.memories:
+            learned = (m.learned or m.what or "")[:80]
+            tbl.add_row(m.kind, m.title, learned)
 
-    # --- worker thread management ---
 
-    def _start_run(self) -> None:
-        thread = threading.Thread(
-            target=self._run_worker, name="droids-agents-run", daemon=True
-        )
-        thread.start()
-        self._run_thread = thread
+class SearchScreen(Screen):
+    """Search memories across droids-mem (image 4)."""
 
-    def _run_worker(self) -> None:
-        state = self._state
+    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._results: list[Memory] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="search-container"):
+            yield Static("[bold]Search memories[/]", id="search-title")
+            yield Input(placeholder="Search memories…", id="search-input")
+            yield DataTable(id="results-table", zebra_stripes=True, cursor_type="row")
+            yield Static("[dim]type a query and press enter • esc back[/]", id="search-hint")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#results-table", DataTable)
+        tbl.add_columns("kind", "title", "task_type", "learned")
+        self.query_one("#search-input", Input).focus()
+
+    @on(Input.Submitted, "#search-input")
+    def _on_query(self, event: Input.Submitted) -> None:
+        self._run_search(event.value.strip())
+
+    @work(thread=True, exclusive=True)
+    def _run_search(self, query: str) -> None:
+        if not query:
+            return
         try:
-            settings = Settings.load()
-            state.event("[green]settings loaded[/]")
+            results = memquery.search(query)
+        except MemQueryError as e:
+            self.app.call_from_thread(self.notify, f"droids-mem: {e}", severity="error")
+            return
+        self.app.call_from_thread(self._populate, results)
 
-            # Pre-flight: droids-mem-mcp /healthz. Surface result explicitly
-            # so the user can see whether the memory backend is up BEFORE
-            # any LLM call is made.
-            mem_ok, mem_detail = _ping_mem(settings)
-            if mem_ok:
-                state.event(f"[bold green]droids-mem: connected[/] ({mem_detail})")
-            else:
-                state.event(f"[bold red]droids-mem: UNREACHABLE[/] ({mem_detail})")
-                state.event(
-                    "[red]hint: build with `go build ./cmd/droids-mem-mcp` in "
-                    "droids-mem/, then run `DROIDS_MEM_MCP_TOKEN=$TOKEN "
-                    "./droids-mem-mcp &`[/]"
-                )
-                state.error = f"droids-mem-mcp not reachable: {mem_detail}"
-                state.status = "error"
-                return
+    def _populate(self, results: list[Memory]) -> None:
+        self._results = results
+        tbl = self.query_one("#results-table", DataTable)
+        tbl.clear()
+        for m in results:
+            tbl.add_row(m.kind, m.title, m.task_type or "—", (m.learned or "")[:60])
+        self.notify(f"{len(results)} result(s)", severity="information")
 
-            # Pre-flight: agentspan reachable. Same surfacing.
-            as_ok, as_detail = _ping_agentspan(settings)
-            if as_ok:
-                state.event(f"[bold green]agentspan: connected[/] ({as_detail})")
-            else:
-                state.event(f"[bold red]agentspan: UNREACHABLE[/] ({as_detail})")
-                state.event(
-                    "[red]hint: `cd ~/.droids-agents && agentspan server start`[/]"
-                )
-                state.error = f"agentspan not reachable: {as_detail}"
-                state.status = "error"
-                return
 
-            label = classify_prompt(self._prompt, settings=settings)
-            state.event(f"classifier → {label}")
-            steps: list[str] = (
-                plan_mixed_steps(self._prompt, settings=settings)
-                if label == "mixed"
-                else [label]
-            )
-            with state.lock:
-                state.steps = steps
-                state.task_type = label_to_task_type(steps[0])
-            state.event(f"steps: {steps}")
-            if "messaging" in steps and not settings.gmail_enabled:
-                state.event(
-                    "[bold red]ERROR[/] messaging step requested but Gmail not configured"
-                )
-                state.error = "Gmail is not configured; this prompt needs the messaging Subteam."
-                state.status = "error"
-                return
+# --- Session pane + multi-session screen (Phase 3) ------------------------
 
-            try:
-                mem_result = fetch_mem_context(
-                    settings, task_type=state.task_type, query=self._prompt
-                )
-            except MemFetchError as e:
-                state.event(f"[bold red]mem_context failed[/]: {e}")
-                state.error = f"droids-mem unreachable: {e}"
-                state.status = "error"
-                return
 
-            with state.lock:
-                state.session_id = mem_result.session_id
-            state.event(f"session_id minted: {mem_result.session_id}")
+def _csv_list(raw: str) -> list[str]:
+    return [c.strip() for c in raw.split(",") if c.strip()]
 
-            slice_map = {
-                role: slice_for(role, mem_result.bundle, self._prompt)
-                for role in _roles_for(steps)
-            }
-            pool = NamePool()
-            for role in _roles_for(steps):
-                droid = pool.claim()
-                with state.lock:
-                    state.agents.append(
-                        {"droid_name": droid, "role": role, "status": "pending"}
-                    )
 
-            max_total_tokens = (
-                usd_to_max_total_tokens(self._max_cost_usd)
-                if self._max_cost_usd is not None
-                else None
-            )
-            root = build_root(
-                settings,
-                pool=pool,
-                prompt=self._prompt,
-                steps=steps,
-                session_id=mem_result.session_id,
-                competitors=self._competitors,
-                docs_basenames=[],
-                slice_map=slice_map,
-                max_total_tokens=max_total_tokens,
-            )
+class SessionPane(Vertical):
+    """One live session: conversation feed (left) + Statistics (right) + join
+    input (bottom). Polls a SessionState the registry already drives — does NOT
+    start the worker itself. Holds direct widget refs so multiple panes coexist
+    in tabs without id collisions."""
 
-            state.status = "running"
-            state.event("agentspan: running…")
-            runtime = connect_runtime(settings)
-            result = runtime.run(  # type: ignore[attr-defined]
-                root,
-                self._prompt,
-                context={"task_type_override": None, "dry_run": False},
-            )
-            with state.lock:
-                state.exec_id = getattr(result, "execution_id", "") or getattr(
-                    result, "exec_id", ""
-                )
-                state.final_output = getattr(result, "output", None)
-                if getattr(result, "is_waiting", False):
-                    pending = getattr(result, "pending_approval", None) or {}
-                    state.hitl = pending if isinstance(pending, dict) else {}
-                    state.status = "waiting_for_hitl"
-                else:
-                    state.status = "done"
-            state.event(f"agentspan: {state.status}")
-        except Exception as exc:  # noqa: BLE001 — surface as TUI status
-            state.error = f"{type(exc).__name__}: {exc}"
-            state.status = "error"
-            state.events.append(traceback.format_exc(limit=4))
+    def __init__(self, state: SessionState) -> None:
+        super().__init__()
+        self._state = state
+        self._log = RichLog(highlight=True, markup=True, wrap=True, classes="pane-log")
+        self._stats = Static("", classes="pane-stats")
+        self._input = Input(
+            placeholder="Type your message to join the conversation…", classes="pane-input"
+        )
+        self._rendered = 0
 
-    # --- polling loop ---
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="pane-row"):
+            with VerticalScroll(classes="pane-feed"):
+                yield self._log
+            yield self._stats
+        yield self._input
+
+    def on_mount(self) -> None:
+        self._poll()
+
+    @on(Input.Submitted)
+    def _join(self, event: Input.Submitted) -> None:
+        msg = event.value.strip()
+        if msg and not self._state.send(msg):
+            self.notify("no active session to send to", severity="warning")
+        self._input.value = ""
 
     @work(exclusive=True)
-    async def _poll_state(self) -> None:
-        log = self.query_one("#event-log", RichLog)
-        tbl = self.query_one("#agent-table", DataTable)
-        rendered_events = 0
-        rendered_agents = 0
+    async def _poll(self) -> None:
         while True:
             await asyncio.sleep(_POLL_INTERVAL_S)
-            with self._state.lock:
-                events_snap = list(self._state.events)
-                agents_snap = list(self._state.agents)
-                status = self._state.status
-                exec_id = self._state.exec_id
-                sess = self._state.session_id
-                steps = list(self._state.steps)
-                hitl = dict(self._state.hitl) if self._state.hitl else None
-                error = self._state.error
-                final = self._state.final_output
-
-            for line in events_snap[rendered_events:]:
-                log.write(line)
-            rendered_events = len(events_snap)
-
-            for row in agents_snap[rendered_agents:]:
-                tbl.add_row(
-                    Text(row["droid_name"], style=color_for_droid(row["droid_name"])),
-                    Text(row["role"], style=color_for_role(row["role"].title())),
-                    Text(row["status"], style="dim"),
-                )
-            rendered_agents = len(agents_snap)
-
-            self.query_one("#status-text", Static).update(
-                _status_text(status, error=error)
-            )
-            self.query_one("#exec-text", Static).update(exec_id or "…")
-            self.query_one("#session-text", Static).update(sess or "…")
-            self.query_one("#steps-text", Static).update(
-                f"steps: {' → '.join(steps) if steps else '…'}"
-            )
-
-            if hitl is not None:
-                self.query_one("#hitl-panel", Static).update(_hitl_text(hitl, exec_id))
-            elif error:
-                self.query_one("#hitl-panel", Static).update(
-                    Text(f"error: {error}", style="bold red")
-                )
-            elif status == "done":
-                self.query_one("#hitl-panel", Static).update(
-                    Text(f"final output ready (see RichLog): {final!r}", style="bold green")
-                )
-
-            if status in {"done", "error", "waiting_for_hitl"}:
+            snap = self._state.snapshot()
+            for line in snap.feed[self._rendered:]:
+                self._log.write(line)
+            self._rendered = len(snap.feed)
+            self._stats.update(_stats_text(snap))
+            if snap.status in {sessions.DONE, sessions.ERROR}:
                 return
+
+
+class NewSessionModal(ModalScreen):
+    """Prompt for a new concurrent session (Ctrl+N). Dismisses with
+    (prompt, competitors) or None on cancel."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-box"):
+            yield Static("[bold]New session[/]")
+            yield Input(placeholder="task prompt", id="m-prompt")
+            yield Input(placeholder="competitors (csv, optional)", id="m-comp")
+            with Horizontal(id="modal-actions"):
+                yield Button("Start", variant="primary", id="m-start")
+                yield Button("Cancel", id="m-cancel")
+
+    @on(Button.Pressed, "#m-start")
+    def _start(self) -> None:
+        prompt = self.query_one("#m-prompt", Input).value.strip()
+        if not prompt:
+            self.notify("prompt required", severity="warning")
+            return
+        comps = _csv_list(self.query_one("#m-comp", Input).value)
+        self.dismiss((prompt, comps))
+
+    @on(Button.Pressed, "#m-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SessionsScreen(Screen):
+    """Tabbed multi-session view (image 1). Each tab is a SessionPane over one
+    registry session. Cap-bounded concurrency; Ctrl+N new, Ctrl+W close."""
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit"),
+        Binding("ctrl+n", "new_session", "New"),
+        Binding("ctrl+w", "close_session", "Close"),
+        Binding("ctrl+p", "browse", "Sessions"),
+    ]
+
+    def __init__(
+        self, *, first_prompt: str, first_competitors_csv: str, max_cost_usd: float | None
+    ) -> None:
+        super().__init__()
+        self._registry = SessionRegistry()
+        self._settings: Any = None
+        self._max_total_tokens = (
+            usd_to_max_total_tokens(max_cost_usd) if max_cost_usd is not None else None
+        )
+        self._pending_first = (first_prompt, _csv_list(first_competitors_csv))
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield TabbedContent(id="session-tabs")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            self._settings = Settings.load()
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"settings error: {e}", severity="error")
+            return
+        self._boot()
+
+    @work(thread=True)
+    def _boot(self) -> None:
+        # Best-effort: bring droids-mem up before the first run (LaunchAgent
+        # usually already has). Then spawn on the UI thread.
+        _ensure_droids_mem()
+        prompt, comps = self._pending_first
+        self.app.call_from_thread(self._spawn, prompt, comps)
+
+    def _spawn(self, prompt: str, competitors: list[str]) -> None:
+        try:
+            handle = self._registry.spawn(
+                prompt=prompt,
+                competitors=competitors,
+                settings=self._settings,
+                max_total_tokens=self._max_total_tokens,
+            )
+        except RegistryFull as e:
+            self.notify(str(e), severity="warning")
+            return
+        tabs = self.query_one(TabbedContent)
+        pane = SessionPane(handle.state)
+        label = (prompt[:18] + "…") if len(prompt) > 18 else prompt
+        tabs.add_pane(TabPane(f"{handle.key}: {label}", pane, id=handle.key))
+        tabs.active = handle.key
+
+    def action_new_session(self) -> None:
+        def _after(result: Any) -> None:
+            if result:
+                prompt, comps = result
+                self._spawn(prompt, comps)
+
+        self.app.push_screen(NewSessionModal(), _after)
+
+    def action_close_session(self) -> None:
+        tabs = self.query_one(TabbedContent)
+        key = tabs.active
+        if key:
+            self._registry.close(key)
+            tabs.remove_pane(key)
+
+    def action_browse(self) -> None:
+        self.app.push_screen(SessionBrowserScreen())
 
 
 # --- helpers --------------------------------------------------------------
 
 
+_STATUS_STYLE = {
+    sessions.STARTING: ("yellow", "🟡"),
+    sessions.RUNNING: ("bold green", "🟢"),
+    sessions.WAITING_HITL: ("bold yellow", "🟠"),
+    sessions.DONE: ("bold green", "✅"),
+    sessions.ERROR: ("bold red", "🔴"),
+}
+
+
 def _status_text(status: str, *, error: str | None) -> Text:
-    style_map = {
-        "preparing": "yellow",
-        "running": "bold cyan",
-        "waiting_for_hitl": "bold red",
-        "done": "bold green",
-        "error": "bold red",
-    }
-    style = style_map.get(status, "white")
+    style, _ = _STATUS_STYLE.get(status, ("white", ""))
     return Text(status, style=style)
 
 
-def _hitl_text(hitl: dict[str, Any], exec_id: str) -> Text:
-    meta = hitl.get("metadata") or {}
-    droid = meta.get("droid_name", "?")
-    role = meta.get("role_label", meta.get("role", "?"))
-    tool = hitl.get("tool_name", "?")
-    args = hitl.get("tool_args") or {}
-    reason = hitl.get("reason")
-    url = f"http://localhost:6767/executions/{exec_id}" if exec_id else "(unknown)"
-    text = Text()
-    text.append("HITL PAUSE\n", style="bold red on grey15")
-    text.append(droid, style=color_for_droid(droid))
-    text.append(": [", style="dim")
-    text.append(role, style=color_for_role(role))
-    text.append("] ", style="dim")
-    text.append(f"tool={tool}\n", style="bold yellow")
-    if reason:
-        text.append(f"reason: {reason}\n", style="red")
-    for k, v in args.items():
-        s = str(v)
-        if len(s) > 200:
-            s = s[:199] + "…"
-        text.append(f"  {k}: {s}\n", style="dim white")
-    text.append("approve at: ", style="dim")
-    text.append(url, style="underline cyan")
-    return text
+def _stats_text(snap: "sessions.SessionSnapshot") -> Text:
+    """Render the Statistics panel (image 2)."""
+    style, dot = _STATUS_STYLE.get(snap.status, ("white", ""))
+    cost = f"${snap.cost_usd:.4f}" if snap.cost_usd is not None else "—"
+    t = Text()
+    t.append("📊 Statistics\n\n", style="bold blue")
+    t.append(f"Messages:    {snap.messages}\n")
+    t.append(f"Tool calls:  {snap.tool_calls}\n")
+    t.append(f"Agents:      {snap.agents_seen}/{snap.agents_total}\n")
+    t.append(f"Turns:       {snap.turns}\n")
+    t.append(f"Total Cost:  {cost}\n\n")
+    t.append("Status:      ")
+    t.append(f"{dot} {snap.status}", style=style)
+    if snap.error:
+        t.append(f"\n\n[error] {snap.error}", style="red")
+    if snap.exec_id:
+        t.append(f"\n\nexec: {snap.exec_id}", style="dim")
+    return t
 
 
 # --- App ------------------------------------------------------------------
@@ -450,24 +542,34 @@ def _hitl_text(hitl: dict[str, Any], exec_id: str) -> Text:
 class DroidsAgentsApp(App):
     """Top-level Textual App."""
 
+    # Free Ctrl+P for the sessions browser (Textual binds it to its command
+    # palette by default).
+    ENABLE_COMMAND_PALETTE = False
+
     CSS = """
     #prompt-container {
         padding: 2;
         align: center middle;
         width: 100%;
     }
+    #logo { width: auto; height: auto; color: $accent; padding-bottom: 1; }
     #banner { padding-bottom: 1; }
     #prompt-actions { padding-top: 1; }
 
-    #dash-container { padding: 1; }
-    #status-row { height: 3; padding: 0 1; }
-    #status-row Label { padding-right: 1; }
-    #status-row Static { padding-right: 2; }
-    #steps-text { padding: 1; color: $accent; }
-    #agent-table { height: 10; }
-    #events-pane { height: 14; border: round $primary; }
-    #event-log { padding: 1; }
-    #hitl-panel { padding: 1; border: round $error; min-height: 4; }
+    #session-tabs { height: 1fr; }
+    .pane-row { height: 1fr; }
+    .pane-feed { width: 2fr; height: 1fr; border: round $primary; }
+    .pane-log { padding: 1; }
+    .pane-stats { width: 1fr; height: 1fr; padding: 1; border: round $accent; margin-left: 1; }
+    .pane-input { margin-top: 1; }
+    #modal-box { padding: 2; width: 60%; height: auto; border: round $accent; background: $surface; }
+    #modal-actions { padding-top: 1; height: auto; }
+
+    #browser-container, #detail-container, #search-container { padding: 1; }
+    #browser-title, #detail-title, #search-title { padding-bottom: 1; color: $accent; }
+    #sessions-table, #detail-table, #results-table { height: 1fr; }
+    #browser-hint, #detail-hint, #search-hint { padding-top: 1; color: $text-muted; }
+    #search-input { margin-bottom: 1; }
     """
 
     def on_mount(self) -> None:

@@ -1,4 +1,4 @@
-"""Classifier + mixed_planner with mocked Anthropic SDK."""
+"""Classifier + mixed_planner with injected stub client."""
 
 from __future__ import annotations
 
@@ -22,10 +22,6 @@ class _StubClient:
         self.messages = _StubMessages(text)
 
 
-def _patch_client(monkeypatch, text: str) -> None:
-    monkeypatch.setattr(router, "_client", lambda settings: _StubClient(text))
-
-
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -36,47 +32,48 @@ def _patch_client(monkeypatch, text: str) -> None:
         ("mixed", "mixed"),
     ],
 )
-def test_classify_prompt_normalises_label(monkeypatch, raw, expected) -> None:
-    _patch_client(monkeypatch, raw)
-    out = router.classify_prompt("anything", settings=None)
+def test_classify_prompt_normalises_label(raw, expected) -> None:
+    out = router.classify_prompt("anything", client=_StubClient(raw))
     assert out == expected
 
 
-def test_classify_prompt_falls_back_to_mixed_on_garbage(monkeypatch) -> None:
-    _patch_client(monkeypatch, "I cannot help with that")
-    assert router.classify_prompt("x", settings=None) == "mixed"
+def test_classify_prompt_falls_back_to_mixed_on_garbage() -> None:
+    assert router.classify_prompt("x", client=_StubClient("I cannot help with that")) == "mixed"
 
 
-def test_classify_prompt_falls_back_to_mixed_on_empty(monkeypatch) -> None:
-    _patch_client(monkeypatch, "")
-    assert router.classify_prompt("x", settings=None) == "mixed"
+def test_classify_prompt_falls_back_to_mixed_on_empty() -> None:
+    assert router.classify_prompt("x", client=_StubClient("")) == "mixed"
 
 
-def test_plan_mixed_steps_extracts_unique_ordered_labels(monkeypatch) -> None:
-    _patch_client(monkeypatch, '{"steps":["research","docs","research","messaging"]}')
-    out = router.plan_mixed_steps("x", settings=None)
+def test_plan_mixed_steps_extracts_unique_ordered_labels() -> None:
+    out = router.plan_mixed_steps(
+        "x", client=_StubClient('{"steps":["research","docs","research","messaging"]}')
+    )
     assert out == ["research", "docs", "messaging"]
 
 
-def test_plan_mixed_steps_caps_at_four(monkeypatch) -> None:
-    _patch_client(
-        monkeypatch,
-        '{"steps":["research","docs","form","messaging","research"]}',
+def test_plan_mixed_steps_caps_at_four() -> None:
+    out = router.plan_mixed_steps(
+        "x",
+        client=_StubClient('{"steps":["research","docs","form","messaging","research"]}'),
     )
-    out = router.plan_mixed_steps("x", settings=None)
     assert len(out) == 4
 
 
-def test_plan_mixed_steps_falls_back_on_bad_json(monkeypatch) -> None:
-    _patch_client(monkeypatch, "not json")
-    assert router.plan_mixed_steps("x", settings=None) == ["research"]
+def test_plan_mixed_steps_parses_markdown_fenced_json() -> None:
+    fenced = '```json\n{"steps": ["research", "docs"]}\n```'
+    assert router.plan_mixed_steps("x", client=_StubClient(fenced)) == ["research", "docs"]
 
 
-def test_plan_mixed_steps_falls_back_on_empty_steps(monkeypatch) -> None:
-    _patch_client(monkeypatch, '{"steps":[]}')
-    assert router.plan_mixed_steps("x", settings=None) == ["research"]
+def test_plan_mixed_steps_falls_back_on_bad_json() -> None:
+    assert router.plan_mixed_steps("x", client=_StubClient("not json")) == ["research"]
 
 
-def test_plan_mixed_steps_ignores_unknown_labels(monkeypatch) -> None:
-    _patch_client(monkeypatch, '{"steps":["research","weird","docs"]}')
-    assert router.plan_mixed_steps("x", settings=None) == ["research", "docs"]
+def test_plan_mixed_steps_falls_back_on_empty_steps() -> None:
+    assert router.plan_mixed_steps("x", client=_StubClient('{"steps":[]}')) == ["research"]
+
+
+def test_plan_mixed_steps_ignores_unknown_labels() -> None:
+    assert router.plan_mixed_steps(
+        "x", client=_StubClient('{"steps":["research","weird","docs"]}')
+    ) == ["research", "docs"]

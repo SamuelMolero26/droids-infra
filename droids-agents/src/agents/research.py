@@ -83,6 +83,7 @@ def research_team(
     ]
     return Agent(
         name="research_team",
+        model=_MODEL,
         strategy=Strategy.PARALLEL,
         agents=leaves,
     )

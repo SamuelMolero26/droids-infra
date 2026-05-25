@@ -109,6 +109,7 @@ def doc_team(
     )
     return Agent(
         name="doc_team",
+        model=_MODEL,
         strategy="swarm",
         agents=[ex, sy],
         handoffs=[

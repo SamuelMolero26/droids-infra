@@ -62,11 +62,24 @@ _SUBTEAM_LABELS: tuple[str, ...] = ("research", "docs", "form", "messaging")
 # --- Pre-compile LLM stages (CLI calls these before build_root) -----------
 
 
-def _client(settings: Settings) -> Anthropic:
+def make_client(settings: Settings) -> Anthropic:
     return Anthropic(api_key=settings.anthropic_api_key)
 
 
-def classify_prompt(prompt: str, *, settings: Settings) -> ClassifierLabel:
+def _parse_json_object(raw: str) -> dict:
+    """Parse the first JSON object out of an LLM response.
+
+    Haiku frequently wraps JSON in ```json fences or adds prose around it, so
+    a bare ``json.loads`` fails. Slice from the first ``{`` to the last ``}``
+    before parsing. Raises ValueError if no object is present."""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("no JSON object in response")
+    return json.loads(raw[start : end + 1])
+
+
+def classify_prompt(prompt: str, *, client: Anthropic) -> ClassifierLabel:
     """Cheap one-token classification using haiku. Falls back to ``mixed``.
 
     Cost: ~$0.0001 per call.
@@ -77,7 +90,7 @@ def classify_prompt(prompt: str, *, settings: Settings) -> ClassifierLabel:
         "no punctuation, no explanation. Use `mixed` only when the task clearly "
         "spans two or more of the single-label subteams."
     )
-    msg = _client(settings).messages.create(
+    msg = client.messages.create(
         model=_HAIKU,
         max_tokens=8,
         system=sys,
@@ -90,7 +103,7 @@ def classify_prompt(prompt: str, *, settings: Settings) -> ClassifierLabel:
     return label  # type: ignore[return-value]
 
 
-def plan_mixed_steps(prompt: str, *, settings: Settings) -> list[ClassifierLabel]:
+def plan_mixed_steps(prompt: str, *, client: Anthropic) -> list[ClassifierLabel]:
     """For ``mixed`` prompts: emit an ordered list of subteam labels (max 4, no dup).
 
     JSON-shape enforced via prompt. If the response is malformed, falls back to
@@ -102,7 +115,7 @@ def plan_mixed_steps(prompt: str, *, settings: Settings) -> list[ClassifierLabel
         "key `steps` whose value is an array of 1-4 unique labels in execution "
         "order. Example: {\"steps\": [\"research\", \"docs\"]}."
     )
-    msg = _client(settings).messages.create(
+    msg = client.messages.create(
         model=_HAIKU,
         max_tokens=128,
         system=sys,
@@ -110,7 +123,7 @@ def plan_mixed_steps(prompt: str, *, settings: Settings) -> list[ClassifierLabel
     )
     raw = "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
     try:
-        data = json.loads(raw)
+        data = _parse_json_object(raw)
         steps = data.get("steps") if isinstance(data, dict) else None
         if not isinstance(steps, list) or not steps:
             return ["research"]
@@ -128,6 +141,35 @@ def plan_mixed_steps(prompt: str, *, settings: Settings) -> list[ClassifierLabel
         return out or ["research"]
     except (ValueError, TypeError):
         return ["research"]
+
+
+def extract_competitors(prompt: str, *, client: Anthropic) -> list[str]:
+    """Extract company/product names to research from the prompt.
+
+    Returns empty list if none are identifiable — caller must handle that case.
+    Cost: ~$0.0001 per call.
+    """
+    sys = (
+        "Extract the names of companies, products, or services the user wants to research. "
+        "Return STRICT JSON with a single key `competitors` whose value is an array of name strings. "
+        "Preserve original casing. If none are identifiable, return {\"competitors\": []}. "
+        "Example: \"Compare OpenAI and Anthropic APIs\" → {\"competitors\": [\"OpenAI\", \"Anthropic\"]}."
+    )
+    msg = client.messages.create(
+        model=_HAIKU,
+        max_tokens=128,
+        system=sys,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
+    try:
+        data = _parse_json_object(raw)
+        names = data.get("competitors") if isinstance(data, dict) else None
+        if not isinstance(names, list):
+            return []
+        return [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    except (ValueError, TypeError):
+        return []
 
 
 # --- Root sub-step Agents (memory_loader, rollup) ------------------------

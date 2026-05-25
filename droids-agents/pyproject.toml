@@ -43,6 +43,9 @@ build-backend = "setuptools.build_meta"
 package-dir = { "droids_agents" = "src", "droids_agents.tools" = "src/tools", "droids_agents.guardrails" = "src/guardrails", "droids_agents.agents" = "src/agents" }
 packages = ["droids_agents", "droids_agents.tools", "droids_agents.guardrails", "droids_agents.agents"]
 
+[tool.setuptools.package-data]
+droids_agents = ["assets/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

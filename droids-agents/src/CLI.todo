@@ -6,4 +6,7 @@ Needed:
 Future:
 [ ] Search / session / mem on droids-mem
 [ ] Token usage
+[ ] droids-mem: add `list --session-id <id>` filter for unbounded per-session
+    history. V1 session browser uses `list --limit 100` + group-by-session_id
+    client-side (caps at 100 recent memories); --session-id removes that cap.
 
