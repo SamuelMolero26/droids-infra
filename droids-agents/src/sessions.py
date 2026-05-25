@@ -27,6 +27,7 @@ from droids_agents.execution import (
     roles_for_steps,
 )
 from droids_agents.naming import NamePool
+from droids_agents.pricing import BILLING_MODEL, estimate_cost_usd
 from droids_agents.router import make_client
 from droids_agents.runtime import connect_runtime
 
@@ -36,6 +37,7 @@ RUNNING = "running"
 WAITING_HITL = "waiting_hitl"
 DONE = "done"
 ERROR = "error"
+CLOSED = "closed"
 
 
 @dataclass
@@ -77,6 +79,7 @@ class SessionState:
         self.error: str | None = None
         self.final_output: Any = None
         self._stream: Any = None  # AgentStream, once started
+        self._stopped = False  # set by request_stop(); loop breaks, status → CLOSED
 
     # --- runner-side mutations ---
 
@@ -98,6 +101,32 @@ class SessionState:
             self._stream = stream
             self.exec_id = getattr(getattr(stream, "handle", None), "execution_id", "") or ""
             self.status = RUNNING
+
+    def request_stop(self) -> None:
+        """Signal the run loop to stop and best-effort cancel the agentspan
+        execution server-side. Idempotent. agentspan durable executions may not
+        terminate instantly; the loop stops ingesting immediately regardless."""
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            if self.status not in (DONE, ERROR):
+                self.status = CLOSED
+            stream = self._stream
+        # Call stop outside the lock — agentspan I/O may block.
+        for target in (getattr(stream, "handle", None), stream):
+            stop = getattr(target, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001 — best-effort cancel
+                    pass
+                break
+
+    @property
+    def stopped(self) -> bool:
+        with self._lock:
+            return self._stopped
 
     def ingest(self, event: Any) -> None:
         """Fold one AgentEvent into the state. ``event.type`` is a str enum."""
@@ -187,13 +216,14 @@ class SessionState:
 
 
 def _usd_from_tokens(token_usage: Any) -> float | None:
-    """Best-effort cost. agentspan TokenUsage may already carry a cost field;
-    fall back to None if not derivable here."""
-    for attr in ("cost_usd", "total_cost", "cost"):
-        v = getattr(token_usage, attr, None)
-        if isinstance(v, (int, float)):
-            return float(v)
-    return None
+    """Derive cost from agentspan TokenUsage, which only exposes
+    prompt_tokens / completion_tokens / total_tokens (no cost field, no model).
+    Price at sonnet-4-6 — conservative, since specialists run it."""
+    prompt = getattr(token_usage, "prompt_tokens", None)
+    completion = getattr(token_usage, "completion_tokens", None)
+    if not isinstance(prompt, (int, float)) or not isinstance(completion, (int, float)):
+        return None
+    return estimate_cost_usd(BILLING_MODEL, int(prompt), int(completion))
 
 
 DEFAULT_CAP = 3
@@ -271,11 +301,14 @@ class SessionRegistry:
             return list(self._handles.values())
 
     def close(self, key: str) -> None:
-        """Drop a session from the registry. The daemon thread is left to finish
-        (agentspan executions are durable server-side and cannot be force-killed
-        from here)."""
+        """Drop a session from the registry, signalling its run loop to stop and
+        best-effort cancelling the agentspan execution. The daemon thread exits on
+        the next event (or once the stream unblocks); durable executions may take
+        a moment to wind down server-side, but no further tokens are ingested."""
         with self._lock:
-            self._handles.pop(key, None)
+            handle = self._handles.pop(key, None)
+        if handle is not None:
+            handle.state.request_stop()
 
 
 def run_session(
@@ -319,7 +352,11 @@ def run_session(
         )
         state.attach_stream(stream)
         for event in stream:
+            if state.stopped:
+                return  # tab closed — stop ingesting, skip finalize
             state.ingest(event)
+        if state.stopped:
+            return
         state.finalize(stream.get_result())
     except ExecutionError as e:
         state.fail(e.message)

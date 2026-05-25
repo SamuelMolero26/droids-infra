@@ -35,9 +35,13 @@ PRICES: dict[str, ModelPrice] = {
     "claude-haiku-4-5": ModelPrice(prompt=1.0, completion=5.0, cached_read=0.10),
 }
 
-# Blended sonnet worst-case (30% prompt + 70% completion) — used for budget conversion.
+# Worst-case billing model: specialists run this, so it bounds real cost from above.
+# Used for budget conversion AND post-run cost estimation when TokenUsage carries no model.
+BILLING_MODEL: str = "claude-sonnet-4-6"
+
+# Blended worst-case (30% prompt + 70% completion) — used for budget conversion.
 _BLENDED_SONNET_USD_PER_MTOK: float = (
-    0.3 * PRICES["claude-sonnet-4-6"].prompt + 0.7 * PRICES["claude-sonnet-4-6"].completion
+    0.3 * PRICES[BILLING_MODEL].prompt + 0.7 * PRICES[BILLING_MODEL].completion
 )
 
 

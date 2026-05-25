@@ -90,3 +90,9 @@ bin/
 !CONTEXT.md
 !**/CONTEXT.md
 
+# Todo files
+**/*.todo
+**/*.TODO
+*.todo
+*.TODO
+
