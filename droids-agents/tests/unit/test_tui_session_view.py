@@ -10,10 +10,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from droids_agents import sessions, tui
 from droids_agents.sessions import DONE, RUNNING, SessionState
-from droids_agents.tui import DroidsAgentsApp, SessionPane, SessionsScreen
+from droids_agents.tui import DroidsAgentsApp, SessionsScreen
 
 pytestmark = pytest.mark.asyncio
 

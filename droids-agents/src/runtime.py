@@ -7,7 +7,6 @@ reaching into ``cli.py``.
 from __future__ import annotations
 
 from agentspan.agents import AgentRuntime
-
 from droids_agents.config import Settings
 
 

@@ -18,11 +18,11 @@ Layers:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from anthropic import Anthropic
-
 from droids_agents.config import Settings
 from droids_agents.naming import NamePool
 from droids_agents.router import (
@@ -32,8 +32,8 @@ from droids_agents.router import (
     plan_mixed_steps,
 )
 from droids_agents.schemas import (
-    ClassifierLabel,
     LABEL_TO_TASK_TYPE,
+    ClassifierLabel,
     MemoryLoaderResult,
     TaskType,
     label_to_task_type,

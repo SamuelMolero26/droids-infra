@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from droids_agents.schemas import ContextMemory, ContextResponse
 from droids_agents.slicing import slice_for
 

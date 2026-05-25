@@ -5,10 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from droids_agents import sessions
 from droids_agents.execution import ExecutionPlan, PreparedExecution
-from droids_agents.sessions import DONE, ERROR, RUNNING, WAITING_HITL, SessionState, run_session
+from droids_agents.sessions import DONE, ERROR, SessionState, run_session
 
 
 def _event(type_, **kw):

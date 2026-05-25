@@ -12,7 +12,6 @@ import re
 from urllib.parse import urlparse
 
 from agentspan.agents import GuardrailResult
-
 from droids_agents.guardrails import parse_json_content
 
 _MIN_SUMMARY_CHARS: int = 50

@@ -6,8 +6,7 @@ memquery is stubbed so no subprocess/droids-mem is touched.
 from __future__ import annotations
 
 import pytest
-
-from droids_agents import memquery, tui
+from droids_agents import memquery
 from droids_agents.memquery import Memory, Session
 from droids_agents.tui import (
     DroidsAgentsApp,

@@ -12,7 +12,6 @@ check inspects the actual submission args.
 from __future__ import annotations
 
 from agentspan.agents import Agent
-
 from droids_agents.naming import NamePool, claim_for_role
 from droids_agents.schemas import FormPlan, FormSubmitResult
 from droids_agents.tools.playwright import (

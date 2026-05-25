@@ -22,7 +22,6 @@ from agentspan.agents import (
     Position,
 )
 from agentspan.agents.handoff import OnTextMention
-
 from droids_agents.guardrails.docs import citations_structural, make_citations_resolve
 from droids_agents.naming import NamePool, claim_for_role
 from droids_agents.schemas import DocSynthesis

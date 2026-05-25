@@ -22,7 +22,7 @@ of the same topology.
 from __future__ import annotations
 
 import json
-from typing import Iterable
+from collections.abc import Iterable
 
 from agentspan.agents import (
     Agent,
@@ -34,7 +34,6 @@ from agentspan.agents import (
     TokenUsageTermination,
 )
 from anthropic import Anthropic
-
 from droids_agents.agents.docs import doc_team
 from droids_agents.agents.form import form_team
 from droids_agents.agents.messaging import messaging_team

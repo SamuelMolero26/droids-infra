@@ -12,7 +12,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from agentspan.agents import Agent, Guardrail, OnFail, Position
-
 from droids_agents.guardrails.messaging import (
     make_recipient_allowlist,
     pii_in_draft,

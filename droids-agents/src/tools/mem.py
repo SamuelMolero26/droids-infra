@@ -23,7 +23,6 @@ import json
 
 import httpx
 from agentspan.agents import mcp_tool
-
 from droids_agents.config import Settings
 from droids_agents.schemas import ContextResponse, MemoryLoaderResult, TaskType
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from droids_agents import execution
 from droids_agents.execution import (
     CompetitorsRequired,

@@ -17,7 +17,6 @@ import re
 from collections.abc import Callable, Iterable
 
 from agentspan.agents import GuardrailResult
-
 from droids_agents.guardrails import parse_json_content
 
 # [source: filename.pdf]  /  [source: notes.md]  etc.

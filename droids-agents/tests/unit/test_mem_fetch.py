@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import httpx
 import pytest
-
 from droids_agents.config import Settings
 from droids_agents.tools import mem as mem_mod
 
@@ -56,7 +54,7 @@ class _MockClient:
         self._call_resp = call_resp
         self.last_call = None
 
-    def __enter__(self) -> "_MockClient":
+    def __enter__(self) -> _MockClient:
         return self
 
     def __exit__(self, *a) -> None:

@@ -26,7 +26,6 @@ from typing import Any
 import click
 import httpx
 import structlog
-
 from droids_agents import logging as dlog
 from droids_agents.config import Settings, SettingsError
 from droids_agents.display import (

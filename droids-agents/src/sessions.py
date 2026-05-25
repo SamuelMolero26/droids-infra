@@ -15,8 +15,9 @@ Phase 3 will wrap N of these in a capped SessionRegistry.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from droids_agents.config import Settings
 from droids_agents.execution import (

@@ -27,7 +27,14 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
+import httpx
+from droids_agents import memquery, sessions
+from droids_agents.config import Settings
+from droids_agents.memquery import Memory, MemQueryError, Session
+from droids_agents.pricing import usd_to_max_total_tokens
+from droids_agents.sessions import RegistryFull, SessionRegistry, SessionState
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -45,14 +52,6 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
-
-import httpx
-
-from droids_agents import memquery, sessions
-from droids_agents.config import Settings
-from droids_agents.memquery import MemQueryError, Memory, Session
-from droids_agents.pricing import usd_to_max_total_tokens
-from droids_agents.sessions import RegistryFull, SessionRegistry, SessionState
 
 
 def _ensure_droids_mem() -> tuple[bool, str]:
@@ -516,7 +515,7 @@ def _status_text(status: str, *, error: str | None) -> Text:
     return Text(status, style=style)
 
 
-def _stats_text(snap: "sessions.SessionSnapshot") -> Text:
+def _stats_text(snap: sessions.SessionSnapshot) -> Text:
     """Render the Statistics panel (image 2)."""
     style, dot = _STATUS_STYLE.get(snap.status, ("white", ""))
     cost = f"${snap.cost_usd:.4f}" if snap.cost_usd is not None else "—"

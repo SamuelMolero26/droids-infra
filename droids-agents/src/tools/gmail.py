@@ -18,12 +18,11 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from agentspan.agents import tool
+from droids_agents.config import Settings
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-
-from droids_agents.config import Settings
 
 _log = logging.getLogger(__name__)
 

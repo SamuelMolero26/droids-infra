@@ -44,7 +44,7 @@ class Memory:
     created_at: int = 0
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Memory":
+    def from_dict(cls, d: dict) -> Memory:
         return cls(
             id=str(d.get("id", "")),
             kind=str(d.get("kind", "")),

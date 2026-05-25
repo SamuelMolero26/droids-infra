@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
-
 from droids_agents import schemas
+from pydantic import ValidationError
 
 
 def test_label_to_task_type_known_labels() -> None:

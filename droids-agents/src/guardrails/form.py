@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 
 from agentspan.agents import GuardrailResult
-
 from droids_agents.guardrails import parse_json_content
 
 _PII_PATTERNS: dict[str, re.Pattern[str]] = {

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+
 @dataclass(frozen=True)
 class ModelPrice:
     """Per-Mtok USD prices for a single Anthropic model."""
