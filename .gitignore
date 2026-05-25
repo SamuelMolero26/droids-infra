@@ -5,3 +5,94 @@ droids-mem/droids-mem-mcp
 # Go test / build artifacts
 *.test
 *.out
+
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+env/
+venv/
+.venv/
+pip-wheel-metadata/
+*.egg-info/
+.pytest_cache/
+
+# Build / packaging
+dist/
+build/
+eggs/
+parts/
+sdist/
+develop-eggs/
+wheelhouse/
+
+# Virtual environment directories
+venv/
+ENV/
+env.bak/
+
+# Coverage and test reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+test-results/
+
+# Logs
+*.log
+*.out
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Go vendor and binaries
+vendor/
+bin/
+
+# SQLite DBs and local state
+*.db
+*.db-wal
+*.db-shm
+
+# CodeGraph (analysis cache)
+.codegraph/
+**/.codegraph/
+
+# Misc caches
+.cache/
+.ruff_cache/
+
+# Temporary files
+*.tmp
+*.temp
+~*
+
+# Markdown docs and notes
+**/*.md
+!CLAUDE.md
+!**/CLAUDE.md
+!CONTEXT.md
+!**/CONTEXT.md
+
+# Todo files
+**/*.todo
+**/*.TODO
+*.todo
+*.TODO
+

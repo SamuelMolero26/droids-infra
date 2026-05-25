@@ -11,7 +11,7 @@ This command detects the project type (TypeScript, Python, or hybrid TS frontend
 
 <context>
 Project files: !`find . -maxdepth 1 -not -name '.' -not -name '.git' -not -name 'node_modules' -not -name '__pycache__' -not -name '.venv' -not -name 'venv' | head -40`
-Package files: !`for f in package.json pyproject.toml requirements.txt setup.py Pipfile Cargo.toml; do [ -f "$f" ] && echo "$f"; done; true`
+Package files: !`ls package.json pyproject.toml requirements.txt setup.py Pipfile Cargo.toml go.mod 2>/dev/null; true`
 Current structure: !`find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/.venv/*' -not -path '*/venv/*' -not -path '*/.next/*' -not -path '*/dist/*' -not -path '*/.DS_Store' | head -80`
 Existing env files: !`ls -la .env* 2>/dev/null || echo "No .env files found"`
 Existing gitignore: !`cat .gitignore 2>/dev/null || echo "No .gitignore found"`
@@ -24,9 +24,10 @@ Existing gitignore: !`cat .gitignore 2>/dev/null || echo "No .gitignore found"`
 1. Analyze the project to determine its type:
    - **TypeScript/JavaScript**: Has `package.json`, `.ts`/`.tsx`/`.js`/`.jsx` files
    - **Python**: Has `requirements.txt`, `pyproject.toml`, `setup.py`, or `.py` files
-   - **Hybrid**: Both present (Python backend + React/TS frontend)
-2. Identify the framework(s) in use (Next.js, React, Express, FastAPI, Flask, Django, etc.)
-3. Identify the entry points and main application logic
+   - **Go**: Has `go.mod`, `.go` files
+   - **Hybrid**: Multiple present (e.g. Go/Python backend + React/TS frontend)
+2. Identify the framework(s) in use (Next.js, React, Express, FastAPI, Flask, Django, cobra/viper, gin/echo/chi, etc.)
+3. Identify the entry points and main application logic (for Go, the `package main` + `func main()` under `cmd/` or root)
 
 ## Phase 2: Secret Extraction (Parallel Sub-Agents)
 
@@ -85,6 +86,7 @@ Compile all findings into a unified secrets inventory.
 3. Replace all hardcoded values in source files with environment variable references:
    - TypeScript/JS: `process.env.VARIABLE_NAME`
    - Python: `os.environ.get("VARIABLE_NAME")` or using `python-dotenv`
+   - Go: `os.Getenv("VARIABLE_NAME")` behind a typed config struct (see `samber/cc-skills-golang@golang-spf13-viper` for env binding, or stdlib `os` for small tools)
 
 ## Phase 4: Folder Restructure
 
@@ -129,7 +131,21 @@ src/ (or app/)
 tests/              # Test files
 ```
 
-**Hybrid (Python backend + TS frontend):**
+**Go project:**
+```
+cmd/
+  {binary-name}/    # package main, one dir per binary entrypoint
+    main.go
+internal/           # private packages — not importable by other modules
+  {domain}/         # business logic grouped by domain, not by layer
+pkg/                # optional: packages safe for external import
+api/                # optional: OpenAPI/proto definitions (services)
+go.mod
+go.sum
+```
+Right-size it: a small CLI or single-binary tool stays flat (`main.go` + a few packages) — do NOT force `cmd/`/`internal/`/`pkg/` onto a 200-line tool. Defer to `samber/cc-skills-golang@golang-project-layout` for the full decision table (CLI / library / service / monorepo) and module-naming rules.
+
+**Hybrid (Python/Go backend + TS frontend):**
 ```
 backend/
   app/              # Python application
@@ -155,17 +171,32 @@ Rules:
 - Update all import paths after moving files
 - Verify no circular dependencies are introduced
 
+## Phase 4b: Go Standards (Go projects only)
+
+Skip this phase entirely for non-Go projects. For Go projects, bring the codebase up to idiomatic Go standards. Each item below delegates to a focused skill in the `samber/cc-skills-golang` plugin — invoke the named skill for full rules, file trees, and examples rather than guessing.
+
+1. **Layout** — apply `samber/cc-skills-golang@golang-project-layout`. Confirm module name in `go.mod` matches the repo path; private code under `internal/`; one `package main` per `cmd/{name}/`.
+2. **Naming & style** — apply `samber/cc-skills-golang@golang-naming` and `samber/cc-skills-golang@golang-code-style`. Exported identifiers documented; no stutter (`http.HTTPServer` → `http.Server`); short receiver names; `gofmt`/`goimports` clean.
+3. **Error handling** — apply `samber/cc-skills-golang@golang-error-handling`. Wrap with `fmt.Errorf("...: %w", err)`; sentinel errors via `errors.Is`/`errors.As`; no silent `_ =` discards on meaningful errors; no `panic` in library code.
+4. **Config** — typed config struct populated from env at startup (12-Factor). See `samber/cc-skills-golang@golang-spf13-viper` if the project already uses viper; otherwise stdlib `os.Getenv` behind one loader.
+5. **Testing** — apply `samber/cc-skills-golang@golang-testing` (and `@golang-stretchr-testify` if testify is in use). Table-driven tests; isolate external state per test; `go test ./...` green.
+6. **Lint & safety** — apply `samber/cc-skills-golang@golang-lint` and `samber/cc-skills-golang@golang-security`. Run `golangci-lint run` and resolve findings; check for SQL injection, command injection, unvalidated input at boundaries.
+7. **Docs** — apply `samber/cc-skills-golang@golang-documentation`. Package doc comment on each package; exported symbols have doc comments starting with the identifier name.
+
+Verification for Go: `go build ./...`, `go vet ./...`, `go test ./...`, and `golangci-lint run` (if available) all pass after restructuring.
+
 ## Phase 5: Configuration & Deployment Readiness
 
 1. Ensure `.gitignore` exists and includes:
    - `.env` (never commit secrets)
    - `node_modules/`, `__pycache__/`, `.venv/`, `dist/`, `.next/`
+   - Go: compiled binaries (`/{binary-name}`, `*.exe`), `vendor/` (if not committed), coverage output (`*.out`)
    - OS files (`.DS_Store`, `Thumbs.db`)
    - IDE files (`.vscode/`, `.idea/`)
 2. Ensure `tsconfig.json` exists and is properly configured (for TS projects)
-3. Ensure `requirements.txt` or `pyproject.toml` has all dependencies (for Python projects)
-4. Add a `config/` module that centralizes all environment variable reads with validation
-5. Verify the project builds/runs after restructuring
+3. Ensure dependency manifests are complete: `requirements.txt`/`pyproject.toml` (Python); `go.mod` + `go.sum` tidy via `go mod tidy` (Go)
+4. Add a centralized config module/struct that reads all environment variables with validation
+5. Verify the project builds/runs after restructuring (`go build ./...` for Go)
 
 ## Phase 6: README Generation
 
@@ -184,11 +215,12 @@ Generate a comprehensive `README.md` with:
 
 <verification>
 Before completing, verify:
-- Run `grep -r "sk-\|api_key\|apiKey\|API_KEY\|secret\|password\|Bearer " --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" src/ app/ 2>/dev/null` to confirm no secrets remain in source
+- Run `grep -rn "sk-\|api_key\|apiKey\|API_KEY\|secret\|password\|Bearer " --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" --include="*.go" . 2>/dev/null` to confirm no secrets remain in source
 - `.env` file exists with real values
 - `.env.example` file exists with placeholder values
 - `.env` is listed in `.gitignore`
-- The project builds without errors (`npm run build` or `python -c "import app"`)
+- The project builds without errors (`npm run build`, `python -c "import app"`, or `go build ./...`)
+- For Go projects, Phase 4b verification passes (`go vet ./...`, `go test ./...`, `golangci-lint run`)
 - All imports resolve correctly after restructuring
 - README.md is accurate and complete
 </verification>
