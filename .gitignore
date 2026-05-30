@@ -5,8 +5,6 @@ droids-mem/droids-mem-mcp
 # Go test / build artifacts
 *.test
 *.out
-
-
 # macOS
 .DS_Store
 
@@ -19,6 +17,12 @@ droids-mem/droids-mem-mcp
 .env
 .env.*
 !.env.example
+
+# Local state and tokens
+**/.droids-mem/
+**/token
+**/mcp.pid
+**/mcp.log
 
 # Python
 __pycache__/
@@ -44,7 +48,6 @@ develop-eggs/
 wheelhouse/
 
 # Virtual environment directories
-venv/
 ENV/
 env.bak/
 
@@ -58,7 +61,6 @@ test-results/
 
 # Logs
 *.log
-*.out
 
 # Node
 node_modules/
@@ -87,15 +89,6 @@ bin/
 *.tmp
 *.temp
 ~*
-
-# Markdown docs and notes
-**/*.md
-!CLAUDE.md
-!**/CLAUDE.md
-!CONTEXT.md
-!**/CONTEXT.md
-!README.md
-!**/README.md
 
 # Todo files
 **/*.todo
