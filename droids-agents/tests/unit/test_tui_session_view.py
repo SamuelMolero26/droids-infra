@@ -29,7 +29,7 @@ def _stub(monkeypatch) -> None:
     monkeypatch.setattr(tui.Settings, "load", classmethod(lambda cls: object()))
     monkeypatch.setattr(tui, "_ensure_droids_mem", lambda: (True, "ok"))
 
-    def _fake_run(state: SessionState, *, settings, competitors, max_total_tokens):
+    def _fake_run(state: SessionState, *, settings, competitors):
         state.set_plan(["research"])
         state.status = RUNNING
         state.ingest(_evt("message", content="hi"))
@@ -43,7 +43,7 @@ async def test_first_session_spawns_tab(monkeypatch) -> None:
     app = DroidsAgentsApp()
     async with app.run_test() as pilot:
         app.push_screen(
-            SessionsScreen(first_prompt="research X", first_competitors_csv="X", max_cost_usd=None)
+            SessionsScreen(first_prompt="research X", first_competitors_csv="X", )
         )
         await pilot.pause(0.4)
         screen = app.screen
@@ -57,7 +57,7 @@ async def test_second_spawn_and_close(monkeypatch) -> None:
     _stub(monkeypatch)
     app = DroidsAgentsApp()
     async with app.run_test() as pilot:
-        screen = SessionsScreen(first_prompt="a", first_competitors_csv="X", max_cost_usd=None)
+        screen = SessionsScreen(first_prompt="a", first_competitors_csv="X", )
         app.push_screen(screen)
         await pilot.pause(0.4)
         screen._spawn("second task", ["Y"])
@@ -73,7 +73,7 @@ async def test_cap_blocks_excess_spawns(monkeypatch) -> None:
     _stub(monkeypatch)
     app = DroidsAgentsApp()
     async with app.run_test() as pilot:
-        screen = SessionsScreen(first_prompt="a", first_competitors_csv="", max_cost_usd=None)
+        screen = SessionsScreen(first_prompt="a", first_competitors_csv="", )
         screen._registry.cap = 2
         app.push_screen(screen)
         await pilot.pause(0.4)

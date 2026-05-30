@@ -14,9 +14,11 @@ Field semantics:
 
 from __future__ import annotations
 
+import re
 from typing import Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- Classifier vocab ----------------------------------------------------
 
@@ -94,11 +96,49 @@ class MemoryLoaderResult(BaseModel):
 # --- Sub-agent outputs --------------------------------------------------
 
 
+_MIN_SUMMARY_CHARS: int = 50
+
+_APOLOGY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bi couldn'?t find\b",
+        r"\bi (do not|don'?t) have access\b",
+        r"\bas an ai\b",
+        r"\bi'?m unable to\b",
+        r"\bno (information|data) (is )?available\b",
+    )
+)
+
+
 class CompetitorFinding(BaseModel):
+    """Final structured output of a research leaf.
+
+    Validation lives on the schema (length, scheme, apology). agentspan's
+    structured-output layer enforces these at parse time — no separate output
+    guardrail is needed. Intermediate planning prose never reaches this model.
+    """
+
     competitor: str
-    summary: str
+    summary: str = Field(min_length=_MIN_SUMMARY_CHARS)
     source_url: str
     notes: str | None = None
+
+    @field_validator("source_url")
+    @classmethod
+    def _http_scheme(cls, v: str) -> str:
+        scheme = urlparse(v).scheme
+        if scheme not in ("http", "https"):
+            raise ValueError(f"source_url scheme must be http(s), got {scheme!r}")
+        return v
+
+    @field_validator("summary")
+    @classmethod
+    def _no_apology(cls, v: str) -> str:
+        for pat in _APOLOGY_PATTERNS:
+            m = pat.search(v)
+            if m is not None:
+                raise ValueError(f"summary contains apology pattern: {m.group(0)!r}")
+        return v
 
 
 class DocSynthesis(BaseModel):

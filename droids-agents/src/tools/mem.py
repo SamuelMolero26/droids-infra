@@ -2,8 +2,10 @@
 
 Two surfaces:
 
-1. ``mem_tools(settings)`` — builds the MCP tool list attached to the Rollup
-   agent (the sole writer per the broker pattern, ADR 0004).
+1. ``mem_write_tools(settings)`` — builds a native Python ``mem_save`` tool
+   attached to the Rollup agent (the sole writer per the broker pattern,
+   ADR 0004). The tool performs a fresh MCP handshake for each call, avoiding
+   stale transport-session caches in agentspan's Java-side MCP discovery.
 2. ``fetch_mem_context(settings, task_type, query)`` — direct JSON-RPC call
    used by the CLI BEFORE compiling Root, so Subteam factories can bake the
    sliced Bundle into their instructions. This is a V1 simplification of the
@@ -22,7 +24,7 @@ from __future__ import annotations
 import json
 
 import httpx
-from agentspan.agents import mcp_tool
+from agentspan.agents import ToolContext, mcp_tool, tool
 from droids_agents.config import Settings
 from droids_agents.schemas import ContextResponse, MemoryLoaderResult, TaskType
 
@@ -35,8 +37,17 @@ MEM_TOOL_NAMES: tuple[str, ...] = ("mem_save", "mem_search", "mem_context", "mem
 _MCP_FETCH_TIMEOUT_S: float = 15.0
 
 
+class MemFetchError(RuntimeError):
+    """Raised when the direct mem_context fetch fails (HTTP, auth, parse)."""
+
+
 def mem_tools(settings: Settings) -> list:
-    """Build the MCP tool list for the Rollup agent."""
+    """Build the server-side MCP tool list.
+
+    Kept for the unused ``memory_loader_agent`` path and future read tools.
+    Rollup writes should use ``mem_write_tools`` instead so they do not trigger
+    agentspan's Java-side ``LIST_MCP_TOOLS`` cache.
+    """
     return [
         mcp_tool(
             server_url=settings.droids_mem_mcp_url,
@@ -46,8 +57,49 @@ def mem_tools(settings: Settings) -> list:
     ]
 
 
-class MemFetchError(RuntimeError):
-    """Raised when the direct mem_context fetch fails (HTTP, auth, parse)."""
+def mem_write_tools(settings: Settings) -> list:
+    """Build native Python memory write tools for the Rollup agent.
+
+    The exposed tool is still named ``mem_save`` so Rollup instructions and the
+    droids-mem wire contract stay unchanged. Unlike ``mcp_tool(...)``, this does
+    not require agentspan/Conductor to run ``LIST_MCP_TOOLS`` and cache an MCP
+    transport session ID.
+    """
+
+    @tool(name="mem_save")
+    def mem_save(
+        kind: str,
+        title: str,
+        what: str,
+        learned: str,
+        task_type: str,
+        context: ToolContext,
+        session_id: str = "",
+        tags: str = "",
+        force: bool = False,
+    ) -> dict:
+        """Persist one memory row to droids-mem using the current Execution session_id."""
+        args = {
+            "kind": kind,
+            "title": title,
+            "what": what,
+            "learned": learned,
+            "task_type": task_type,
+            "session_id": session_id,
+            "tags": tags,
+            "force": force,
+        }
+        if context.state.get("dry_run"):
+            return {
+                "ok": True,
+                "dry_run": True,
+                "tool": "mem_save",
+                MEM_SESSION_KEY: session_id,
+                "args": args,
+            }
+        return _call_mcp_tool(settings, "mem_save", args)
+
+    return [mem_save]
 
 
 def _parse_mcp_body(resp: httpx.Response) -> dict:
@@ -94,6 +146,115 @@ def _mcp_post(
     return client.post(url, headers=headers, content=json.dumps(payload))
 
 
+def _mcp_initialize(client: httpx.Client, settings: Settings) -> str:
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "droids-agents", "version": "0.1.0"},
+        },
+    }
+    init_resp = _mcp_post(
+        client,
+        settings.droids_mem_mcp_url,
+        token=settings.droids_mem_mcp_token,
+        mcp_session_id=None,
+        payload=init_payload,
+    )
+    if init_resp.status_code == 401:
+        raise MemFetchError("droids-mem-mcp returned HTTP 401 (bearer auth)")
+    if init_resp.status_code != 200:
+        raise MemFetchError(
+            f"droids-mem-mcp initialize failed: HTTP "
+            f"{init_resp.status_code}: {init_resp.text[:200]}"
+        )
+    mcp_sid = init_resp.headers.get("Mcp-Session-Id")
+    if not mcp_sid:
+        raise MemFetchError("droids-mem-mcp did not return an Mcp-Session-Id header")
+
+    _mcp_post(
+        client,
+        settings.droids_mem_mcp_url,
+        token=settings.droids_mem_mcp_token,
+        mcp_session_id=mcp_sid,
+        payload={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        },
+    )
+    return mcp_sid
+
+
+def _unwrap_tool_result(body: dict) -> dict:
+    if "error" in body:
+        return {"ok": False, "error": body["error"]}
+
+    result = body.get("result") or {}
+    content = result.get("content") or []
+    text_payload = ""
+    for item in content:
+        if item.get("type") == "text":
+            text_payload = item.get("text", "")
+            break
+
+    if result.get("isError"):
+        return {"ok": False, "error": text_payload or result}
+
+    inner = result.get("structuredContent")
+    if isinstance(inner, dict):
+        return inner
+    if text_payload:
+        try:
+            parsed = json.loads(text_payload)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+        return {"ok": True, "text": text_payload}
+    return {"ok": True}
+
+
+def _call_mcp_tool(settings: Settings, name: str, arguments: dict) -> dict:
+    """Call one droids-mem MCP tool via a fresh Streamable HTTP session."""
+    try:
+        with httpx.Client(timeout=_MCP_FETCH_TIMEOUT_S) as client:
+            mcp_sid = _mcp_initialize(client, settings)
+            call_resp = _mcp_post(
+                client,
+                settings.droids_mem_mcp_url,
+                token=settings.droids_mem_mcp_token,
+                mcp_session_id=mcp_sid,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            )
+    except (httpx.HTTPError, MemFetchError) as e:
+        return {"ok": False, "tool": name, "error": f"{type(e).__name__}: {e}"}
+
+    if call_resp.status_code != 200:
+        return {
+            "ok": False,
+            "tool": name,
+            "error": (
+                f"droids-mem-mcp returned HTTP {call_resp.status_code}: "
+                f"{call_resp.text[:200]}"
+            ),
+        }
+
+    try:
+        body = _parse_mcp_body(call_resp)
+    except MemFetchError as e:
+        return {"ok": False, "tool": name, "error": str(e)}
+    return _unwrap_tool_result(body)
+
+
 def fetch_mem_context(
     settings: Settings, *, task_type: TaskType, query: str
 ) -> MemoryLoaderResult:
@@ -111,45 +272,8 @@ def fetch_mem_context(
     tok = settings.droids_mem_mcp_token
     try:
         with httpx.Client(timeout=_MCP_FETCH_TIMEOUT_S) as client:
-            # 1. initialize
-            init_payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {"name": "droids-agents", "version": "0.1.0"},
-                },
-            }
-            init_resp = _mcp_post(
-                client, url, token=tok, mcp_session_id=None, payload=init_payload
-            )
-            if init_resp.status_code == 401:
-                raise MemFetchError("droids-mem-mcp returned HTTP 401 (bearer auth)")
-            if init_resp.status_code != 200:
-                raise MemFetchError(
-                    f"droids-mem-mcp initialize failed: HTTP "
-                    f"{init_resp.status_code}: {init_resp.text[:200]}"
-                )
-            mcp_sid = init_resp.headers.get("Mcp-Session-Id")
-            if not mcp_sid:
-                raise MemFetchError(
-                    "droids-mem-mcp did not return an Mcp-Session-Id header"
-                )
-
-            # 2. notifications/initialized (no id → no response expected)
-            _mcp_post(
-                client,
-                url,
-                token=tok,
-                mcp_session_id=mcp_sid,
-                payload={
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                },
-            )
+            # 1 + 2. initialize + notifications/initialized
+            mcp_sid = _mcp_initialize(client, settings)
 
             # 3. tools/call mem_context
             call_resp = _mcp_post(

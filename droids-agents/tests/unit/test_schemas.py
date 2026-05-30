@@ -77,3 +77,56 @@ def test_context_memory_tier_discriminator_enforced() -> None:
         schemas.ContextMemory(
             id="x", kind="task_pattern", task_type="x", title="x", tier="weird"
         )
+
+
+# --- CompetitorFinding validators ----------------------------------------
+# Length / scheme / apology rules used to live in guardrails/research as an
+# OUTPUT guardrail. That fired per LLM turn (including planning prose) and
+# false-tripped HITL. Rules now live on the schema and run only at structured-
+# output parse time.
+
+
+def _finding(**overrides):
+    base = dict(
+        competitor="Acme",
+        summary="x" * 60,
+        source_url="https://example.com",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_competitor_finding_accepts_clean() -> None:
+    cf = schemas.CompetitorFinding(**_finding())
+    assert cf.summary == "x" * 60
+    assert cf.source_url == "https://example.com"
+
+
+def test_competitor_finding_rejects_short_summary() -> None:
+    with pytest.raises(ValidationError):
+        schemas.CompetitorFinding(**_finding(summary="too short"))
+
+
+def test_competitor_finding_rejects_non_http_scheme() -> None:
+    with pytest.raises(ValidationError):
+        schemas.CompetitorFinding(**_finding(source_url="ftp://example.com"))
+
+
+def test_competitor_finding_accepts_http_and_https() -> None:
+    schemas.CompetitorFinding(**_finding(source_url="http://example.com"))
+    schemas.CompetitorFinding(**_finding(source_url="https://example.com"))
+
+
+@pytest.mark.parametrize(
+    "apology",
+    [
+        "As an AI I cannot share that, but here are the details " + "x" * 30,
+        "I couldn't find anything useful about this competitor " + "x" * 30,
+        "I'm unable to access the page but here is what I know " + "x" * 30,
+        "I do not have access to live data however " + "x" * 30,
+        "No information available about pricing or features " + "x" * 30,
+    ],
+)
+def test_competitor_finding_rejects_apology_patterns(apology: str) -> None:
+    with pytest.raises(ValidationError):
+        schemas.CompetitorFinding(**_finding(summary=apology))

@@ -33,7 +33,6 @@ import httpx
 from droids_agents import memquery, sessions
 from droids_agents.config import Settings
 from droids_agents.memquery import Memory, MemQueryError, Session
-from droids_agents.pricing import usd_to_max_total_tokens
 from droids_agents.sessions import RegistryFull, SessionRegistry, SessionState
 from rich.text import Text
 from textual import on, work
@@ -47,6 +46,7 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    ProgressBar,
     RichLog,
     Static,
     TabbedContent,
@@ -141,7 +141,6 @@ class PromptScreen(Screen):
             )
             yield Input(placeholder="e.g. research Anthropic vs OpenAI pricing", id="prompt-input")
             yield Input(placeholder="competitors (optional, csv)", id="competitors-input")
-            yield Input(placeholder="--max-cost-usd (optional, e.g. 0.5)", id="cost-input")
             with Horizontal(id="prompt-actions"):
                 yield Button("Run", variant="primary", id="run-btn")
                 yield Button("Quit", variant="default", id="quit-btn")
@@ -151,6 +150,7 @@ class PromptScreen(Screen):
     def _quit(self) -> None:
         self.app.exit()
 
+    @on(Input.Submitted, "#prompt-input")
     @on(Button.Pressed, "#run-btn")
     def _submit(self) -> None:
         prompt = self.query_one("#prompt-input", Input).value.strip()
@@ -158,19 +158,10 @@ class PromptScreen(Screen):
             self.notify("prompt is required", severity="warning")
             return
         competitors = self.query_one("#competitors-input", Input).value.strip()
-        cost_raw = self.query_one("#cost-input", Input).value.strip()
-        max_cost: float | None = None
-        if cost_raw:
-            try:
-                max_cost = float(cost_raw)
-            except ValueError:
-                self.notify(f"max-cost-usd not a float: {cost_raw}", severity="error")
-                return
         self.app.push_screen(
             SessionsScreen(
                 first_prompt=prompt,
                 first_competitors_csv=competitors,
-                max_cost_usd=max_cost,
             )
         )
 
@@ -351,7 +342,16 @@ class SessionPane(Vertical):
         super().__init__()
         self._state = state
         self._log = RichLog(highlight=True, markup=True, wrap=True, classes="pane-log")
-        self._stats = Static("", classes="pane-stats")
+        self._stats = Static("", classes="pane-stats-text")
+        # ETA is computed in SessionState (rate from monotonic start), so the
+        # bar's own ETA renderer is suppressed via show_eta=False.
+        self._progress = ProgressBar(
+            total=None,
+            show_eta=False,
+            show_percentage=True,
+            classes="pane-progress",
+        )
+        self._eta = Static("ETA: —", classes="pane-eta")
         self._input = Input(
             placeholder="Type your message to join the conversation…", classes="pane-input"
         )
@@ -361,7 +361,10 @@ class SessionPane(Vertical):
         with Horizontal(classes="pane-row"):
             with VerticalScroll(classes="pane-feed"):
                 yield self._log
-            yield self._stats
+            with Vertical(classes="pane-stats"):
+                yield self._stats
+                yield self._progress
+                yield self._eta
         yield self._input
 
     def on_mount(self) -> None:
@@ -383,8 +386,17 @@ class SessionPane(Vertical):
                 self._log.write(line)
             self._rendered = len(snap.feed)
             self._stats.update(_stats_text(snap))
-            if snap.status in {sessions.DONE, sessions.ERROR}:
+            self._refresh_progress(snap)
+            if snap.status in {sessions.DONE, sessions.ERROR, sessions.CLOSED}:
                 return
+
+    def _refresh_progress(self, snap: sessions.SessionSnapshot) -> None:
+        if snap.tasks_total > 0:
+            self._progress.update(total=snap.tasks_total, progress=snap.tasks_done)
+        else:
+            # No task data yet — keep indeterminate (total=None).
+            self._progress.update(total=None, progress=0)
+        self._eta.update(_eta_text(snap))
 
 
 class NewSessionModal(ModalScreen):
@@ -424,21 +436,18 @@ class SessionsScreen(Screen):
     registry session. Cap-bounded concurrency; Ctrl+N new, Ctrl+W close."""
 
     BINDINGS = [
-        Binding("ctrl+c", "app.quit", "Quit"),
+        Binding("ctrl+c", "quit_all", "Quit"),
         Binding("ctrl+n", "new_session", "New"),
         Binding("ctrl+w", "close_session", "Close"),
         Binding("ctrl+p", "browse", "Sessions"),
     ]
 
     def __init__(
-        self, *, first_prompt: str, first_competitors_csv: str, max_cost_usd: float | None
+        self, *, first_prompt: str, first_competitors_csv: str
     ) -> None:
         super().__init__()
         self._registry = SessionRegistry()
         self._settings: Any = None
-        self._max_total_tokens = (
-            usd_to_max_total_tokens(max_cost_usd) if max_cost_usd is not None else None
-        )
         self._pending_first = (first_prompt, _csv_list(first_competitors_csv))
 
     def compose(self) -> ComposeResult:
@@ -456,9 +465,15 @@ class SessionsScreen(Screen):
 
     @work(thread=True)
     def _boot(self) -> None:
-        # Best-effort: bring droids-mem up before the first run (LaunchAgent
-        # usually already has). Then spawn on the UI thread.
-        _ensure_droids_mem()
+        self.app.call_from_thread(self.notify, "Starting droids-mem…", severity="information")
+        ok, detail = _ensure_droids_mem()
+        if not ok:
+            self.app.call_from_thread(
+                self.notify,
+                f"droids-mem unavailable: {detail} — run `go install ./cmd/droids-mem`",
+                severity="error",
+            )
+            return
         prompt, comps = self._pending_first
         self.app.call_from_thread(self._spawn, prompt, comps)
 
@@ -468,7 +483,6 @@ class SessionsScreen(Screen):
                 prompt=prompt,
                 competitors=competitors,
                 settings=self._settings,
-                max_total_tokens=self._max_total_tokens,
             )
         except RegistryFull as e:
             self.notify(str(e), severity="warning")
@@ -497,6 +511,13 @@ class SessionsScreen(Screen):
     def action_browse(self) -> None:
         self.app.push_screen(SessionBrowserScreen())
 
+    @work(thread=True)
+    def action_quit_all(self) -> None:
+        """Cancel every live agentspan execution, then exit the app."""
+        for handle in self._registry.all():
+            handle.state.request_stop()
+        self.app.call_from_thread(self.app.exit)
+
 
 # --- helpers --------------------------------------------------------------
 
@@ -518,21 +539,48 @@ def _status_text(status: str, *, error: str | None) -> Text:
 def _stats_text(snap: sessions.SessionSnapshot) -> Text:
     """Render the Statistics panel (image 2)."""
     style, dot = _STATUS_STYLE.get(snap.status, ("white", ""))
-    cost = f"${snap.cost_usd:.4f}" if snap.cost_usd is not None else "—"
     t = Text()
     t.append("📊 Statistics\n\n", style="bold blue")
     t.append(f"Messages:    {snap.messages}\n")
     t.append(f"Tool calls:  {snap.tool_calls}\n")
-    t.append(f"Agents:      {snap.agents_seen}/{snap.agents_total}\n")
+    t.append(f"Agents:      {snap.agents_seen}\n")
     t.append(f"Turns:       {snap.turns}\n")
-    t.append(f"Total Cost:  {cost}\n\n")
+    t.append(f"Tasks:       {snap.tasks_done}/{snap.tasks_total}\n\n")
     t.append("Status:      ")
     t.append(f"{dot} {snap.status}", style=style)
+    if snap.task_groups:
+        t.append("\n\nProgress by agent:\n", style="bold")
+        for name, g in sorted(snap.task_groups.items()):
+            t.append(f"  {name}: {g['done']}/{g['total']}\n", style="dim")
     if snap.error:
-        t.append(f"\n\n[error] {snap.error}", style="red")
+        t.append(f"\n[error] {snap.error}", style="red")
     if snap.exec_id:
         t.append(f"\n\nexec: {snap.exec_id}", style="dim")
+        if snap.agentspan_url:
+            ui_url = f"{snap.agentspan_url.rstrip('/')}/executions/{snap.exec_id}"
+            t.append(f"\n{ui_url}", style="dim underline cyan")
     return t
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 1:
+        return "<1s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(int(seconds), 3600)
+    m, _ = divmod(rem, 60)
+    return f"{h}h {m}m"
+
+
+def _eta_text(snap: sessions.SessionSnapshot) -> str:
+    elapsed = (
+        _fmt_duration(snap.elapsed_seconds) if snap.elapsed_seconds is not None else "—"
+    )
+    eta = _fmt_duration(snap.eta_seconds) if snap.eta_seconds is not None else "—"
+    return f"Elapsed: {elapsed}   ETA: {eta}"
 
 
 # --- App ------------------------------------------------------------------
@@ -560,6 +608,9 @@ class DroidsAgentsApp(App):
     .pane-feed { width: 2fr; height: 1fr; border: round $primary; }
     .pane-log { padding: 1; }
     .pane-stats { width: 1fr; height: 1fr; padding: 1; border: round $accent; margin-left: 1; }
+    .pane-stats-text { height: auto; }
+    .pane-progress { margin-top: 1; width: 100%; }
+    .pane-eta { color: $text-muted; margin-top: 1; height: auto; }
     .pane-input { margin-top: 1; }
     #modal-box { padding: 2; width: 60%; height: auto; border: round $accent; background: $surface; }
     #modal-actions { padding-top: 1; height: auto; }
