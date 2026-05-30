@@ -15,6 +15,11 @@ droids-mem/droids-mem-mcp
 .idea/
 *.swp
 
+# Secrets — never commit env files (keep .env.example)
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]
@@ -89,6 +94,8 @@ bin/
 !**/CLAUDE.md
 !CONTEXT.md
 !**/CONTEXT.md
+!README.md
+!**/README.md
 
 # Todo files
 **/*.todo

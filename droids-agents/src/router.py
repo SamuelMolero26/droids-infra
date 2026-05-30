@@ -31,7 +31,6 @@ from agentspan.agents import (
     OnFail,
     Position,
     Strategy,
-    TokenUsageTermination,
 )
 from anthropic import Anthropic
 from droids_agents.agents.docs import doc_team
@@ -48,7 +47,7 @@ from droids_agents.schemas import (
     TaskType,
     label_to_task_type,
 )
-from droids_agents.tools.mem import mem_tools
+from droids_agents.tools.mem import mem_tools, mem_write_tools
 
 _HAIKU = "claude-haiku-4-5"  
 _HAIKU_AGENT = "anthropic/claude-haiku-4-5" 
@@ -229,10 +228,15 @@ def rollup_agent(
                 "- `new_patterns` (≤3) — only reusable URLs/selectors/format recipes.\n"
                 "- `new_errors` (≤3) — only failure modes worth recalling.\n"
                 "- `new_rules` (≤2) — only explicit durable preferences from HITL edits.\n"
-                f"After emitting, call mem_save once per row with session_id='{sid}'."
+                "If the preceding Subteam output is empty, missing, or only contains "
+                "tool failures, DO NOT ask the user for data. Emit a failure-oriented "
+                "RollupResult with a required summary and one `new_errors` row that "
+                "captures the missing-output/tool-failure mode.\n"
+                f"After emitting, call mem_save once per row with session_id='{sid}'. "
+                "Never ask follow-up questions."
             )
         ),
-        tools=mem_tools(settings),
+        tools=mem_write_tools(settings),
         output_type=RollupResult,
         metadata=md,
     )
@@ -281,7 +285,6 @@ def build_root(
     competitors: list[str] | None = None,
     docs_basenames: list[str] | None = None,
     slice_map: dict[str, list[str]] | None = None,
-    max_total_tokens: int | None = None,
 ) -> Agent:
     """Compose Root = SEQUENTIAL([*<each step's Subteam>, rollup]).
 
@@ -319,10 +322,6 @@ def build_root(
     )
 
     termination = MaxMessageTermination(_ROOT_MAX_TURNS)
-    if max_total_tokens is not None:
-        termination = termination | TokenUsageTermination(
-            max_total_tokens=max_total_tokens
-        )
 
     return Agent(
         name=_root_name(steps),

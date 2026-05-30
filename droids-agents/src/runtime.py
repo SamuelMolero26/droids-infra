@@ -17,3 +17,17 @@ def connect_runtime(settings: Settings) -> AgentRuntime:
     start`` pinned to ``~/.droids-agents``). The CLI only connects.
     """
     return AgentRuntime(server_url=settings.agentspan_url)
+
+
+def reset_tool_circuit_breakers() -> None:
+    """Best-effort reset of agentspan's in-process tool circuit breakers.
+
+    The breaker is process-local in the Python SDK. Resetting before each new
+    Execution prevents one bad run from disabling a fixed tool for subsequent
+    runs in the same CLI/TUI process.
+    """
+    try:
+        from agentspan.agents.runtime._dispatch import reset_all_circuit_breakers
+    except Exception:  # noqa: BLE001
+        return
+    reset_all_circuit_breakers()

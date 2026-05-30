@@ -5,15 +5,17 @@ stable identifier across runs of the same shape, so leaf names are
 ``competitor_0``, ``competitor_1``, … — NOT the random droid names. The droid
 identity is surfaced via ``metadata`` so the UI and CLI both see it.
 
-Guardrails attach to each LEAF competitor (single-object logic). The
-``research_team`` container has NO guardrails — the per-leaf result is the
-right unit of inspection.
+No OUTPUT guardrails attach to leaves: agentspan fires output guardrails after
+every LLM turn (including planning prose alongside tool calls), so a final-
+shape check would false-trip on intermediates. ``output_type=CompetitorFinding``
+plus on-schema Pydantic validators (length, scheme, apology) enforce structure
+and quality at the only correct boundary — final structured emit. The
+``research_team`` container also has no guardrails.
 """
 
 from __future__ import annotations
 
-from agentspan.agents import Agent, Guardrail, OnFail, Position, Strategy
-from droids_agents.guardrails.research import findings_quality, findings_structural
+from agentspan.agents import Agent, Strategy
 from droids_agents.naming import NamePool, claim_for_role
 from droids_agents.schemas import CompetitorFinding
 from droids_agents.tools.playwright import web_extract_text, web_navigate
@@ -46,21 +48,36 @@ def competitor_agent(
                 f"Prior-run context:\n{s}\n\n"
                 "Task: investigate the competitor and emit a single "
                 "CompetitorFinding JSON object with non-empty `summary` "
-                "(≥50 chars) and an http(s) `source_url`."
+                "(≥50 chars) and an http(s) `source_url`.\n\n"
+                "Tool-budget: at most ONE successful web_navigate + ONE "
+                "web_extract_text. Stop after extracting text and emit the "
+                "CompetitorFinding immediately.\n\n"
+                "HARD STOP RULES — these override everything else:\n"
+                "1. Count every web_navigate and every web_extract_text. Stop "
+                "using tools after a total of 4 tool calls, regardless of outcome.\n"
+                "2. If web_extract_text returns `ok: false` (including "
+                "`no open page`, `empty extraction`, or anti-bot block), DO NOT "
+                "call web_extract_text again, and DO NOT re-navigate to the same "
+                "URL. Either try ONE alternative URL once, or stop tool use.\n"
+                "3. The moment any STOP rule fires, immediately emit a "
+                "CompetitorFinding using the last URL you successfully navigated "
+                "to as `source_url` (or the last URL you attempted if no "
+                "navigation succeeded), and write a `summary` that combines what "
+                "any successful extraction showed with publicly-known facts "
+                f"about {c}. Add a short `notes` line explaining the tool "
+                "outcome (e.g. \"extract failed: no open page\").\n"
+                "4. NEVER emit empty text and NEVER end your turn without a "
+                "CompetitorFinding JSON. Best-effort with a real URL beats "
+                "silence.\n\n"
+                "IMPORTANT: Do NOT output any explanatory or planning text. "
+                "Your only text output must be the final CompetitorFinding JSON."
             )
         ),
         tools=[web_navigate, web_extract_text],
         output_type=CompetitorFinding,
         metadata=md,
-        guardrails=[
-            Guardrail(
-                findings_structural,
-                position=Position.OUTPUT,
-                on_fail=OnFail.RETRY,
-                max_retries=2,
-            ),
-            Guardrail(findings_quality, position=Position.OUTPUT, on_fail=OnFail.HUMAN),
-        ],
+        max_turns=6,
+        max_tokens=1024,
     )
 
 
@@ -76,7 +93,7 @@ def research_team(
             pool,
             competitor=c,
             index=i,
-            slice_lines=slice_map.get(c, []),
+            slice_lines=slice_map.get("competitor", []),
         )
         for i, c in enumerate(competitors)
     ]

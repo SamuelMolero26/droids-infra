@@ -46,9 +46,8 @@ from droids_agents.execution import (
     plan_execution,
 )
 from droids_agents.naming import NamePool
-from droids_agents.pricing import usd_to_max_total_tokens
 from droids_agents.router import make_client
-from droids_agents.runtime import connect_runtime
+from droids_agents.runtime import connect_runtime, reset_tool_circuit_breakers
 from droids_agents.tools.gmail import GMAIL_SCOPES
 
 _DOCS_TOTAL_CAP_BYTES: int = 5 * 1024 * 1024
@@ -151,7 +150,6 @@ main.add_command(typer.main.get_command(_tui_app), name="tui")
 @click.option("--competitors", default="", help="Comma-separated competitor names (research subteam).")
 @click.option("--task-type", default=None, help="Skip classifier; force a TaskType.")
 @click.option("--session-id", default=None, help="Reuse an existing droids-mem session_id.")
-@click.option("--max-cost-usd", type=float, default=None, help="USD budget; converts to max_total_tokens.")
 @click.option("--dry-run", is_flag=True, help="Run pipeline end-to-end but skip side effects (gmail_send, web_submit, mem_save).")
 @click.option("--json", "json_mode", is_flag=True, help="JSON stream to stdout. No colors. No prompts.")
 def run(
@@ -160,7 +158,6 @@ def run(
     competitors: str,
     task_type: str | None,
     session_id: str | None,
-    max_cost_usd: float | None,
     dry_run: bool,
     json_mode: bool,
 ) -> None:
@@ -179,9 +176,6 @@ def run(
 
     client = make_client(settings)
     pool = NamePool(names=None)  # OS-entropy seeded → random per Execution
-    max_total_tokens = (
-        usd_to_max_total_tokens(max_cost_usd) if max_cost_usd is not None else None
-    )
 
     # Decision + assembly are surface-independent (see execution.py). Each
     # ExecutionError subclass maps to a stable CLI exit code.
@@ -200,7 +194,6 @@ def run(
             pool=pool,
             docs_basenames=docs_basenames,
             session_id_override=session_id,
-            max_total_tokens=max_total_tokens,
         )
     except MemUnreachable as e:
         _emit_err(console, e.code, e.message)
@@ -219,10 +212,11 @@ def run(
         steps=plan.steps,
     )
 
+    reset_tool_circuit_breakers()
     runtime = connect_runtime(settings)
 
     try:
-        result = runtime.run(  # type: ignore[attr-defined]
+        stream = runtime.stream(  # type: ignore[attr-defined]
             prepared.root,
             prompt_text,
             context={
@@ -239,7 +233,51 @@ def run(
             "Start it with `agentspan server start`.",
         )
         sys.exit(3)
-    except Exception as e:  # noqa: BLE001 — surface any agentspan runtime error
+    except Exception as e:  # noqa: BLE001
+        _emit_err(console, "runtime_error", str(e))
+        sys.exit(1)
+
+    hitl_fired = False
+    try:
+        for event in stream:
+            if getattr(event, "type", "") == "waiting":
+                hitl_fired = True
+                break
+    except httpx.HTTPError as e:
+        _emit_err(
+            console,
+            "agentspan_unreachable",
+            f"agentspan server not reachable at {settings.agentspan_url}: {e}. "
+            "Start it with `agentspan server start`.",
+        )
+        sys.exit(3)
+    except Exception as e:  # noqa: BLE001
+        _emit_err(console, "runtime_error", str(e))
+        sys.exit(1)
+
+    if hitl_fired:
+        try:
+            status = stream.handle.get_status()
+            pending = status.pending_tool or {}
+        except Exception:  # noqa: BLE001
+            pending = {}
+        meta = pending.get("metadata") or {}
+        print_hitl_pause(
+            console,
+            droid_name=meta.get("droid_name", "?"),
+            role_label=meta.get("role_label", meta.get("role", "?")),
+            tool_name=pending.get("tool_name", pending.get("name", "?")),
+            tool_args=pending.get("tool_args", pending.get("args", {})) or {},
+            session_id=sess_id,
+            exec_id=stream.handle.execution_id,
+            ui_base_url=settings.agentspan_url,
+            reason=pending.get("reason"),
+        )
+        sys.exit(4)
+
+    try:
+        result = stream.get_result()
+    except Exception as e:  # noqa: BLE001
         _emit_err(console, "runtime_error", str(e))
         sys.exit(1)
 
@@ -247,34 +285,11 @@ def run(
     print_execution_header(console, exec_id=outcome.exec_id, task_type_override=task_type)
     print_session_header(console, session_id=sess_id, task_type=task_type_final)
 
-    if outcome.kind == "hitl":
-        meta = outcome.hitl.get("metadata") or {}
-        print_hitl_pause(
-            console,
-            droid_name=meta.get("droid_name", "?"),
-            role_label=meta.get("role_label", meta.get("role", "?")),
-            tool_name=outcome.hitl.get("tool_name", "?"),
-            tool_args=outcome.hitl.get("tool_args", {}) or {},
-            session_id=sess_id,
-            exec_id=outcome.exec_id,
-            ui_base_url=settings.agentspan_url,
-            reason=outcome.hitl.get("reason"),
-        )
-        sys.exit(4)
-
     if outcome.kind == "dry_run":
         console.print(
             json.dumps({"status": "dry_run_pass", "output": outcome.output}, default=str)
         )
         sys.exit(10)
-
-    if outcome.kind == "cost_cap":
-        _emit_err(
-            console,
-            "cost_cap_hit",
-            f"TokenUsageTermination fired: {outcome.termination_reason}",
-        )
-        sys.exit(5)
 
     if json_mode:
         console.print(json.dumps({"status": "ok", "output": outcome.output}, default=str))
@@ -354,7 +369,44 @@ def doctor(json_mode: bool) -> None:
             ok = r.status_code == 200
             results.append({"name": "droids-mem /healthz", "ok": ok, "detail": f"HTTP {r.status_code} at {healthz}"})
         except httpx.HTTPError as e:
-            results.append({"name": "droids-mem /healthz", "ok": False, "detail": f"{e} (start with `./droids-mem-mcp`)"})
+            results.append({"name": "droids-mem /healthz", "ok": False, "detail": f"{e} (start with `droids-mem ensure-server`)"})
+
+    # 2b. MCP initialize handshake — confirms server mints Mcp-Session-Id.
+    # Stateful transport: if the droids-mem PID changed since the agentspan
+    # worker last initialized its MCP client, the worker will receive
+    # `HTTP 404 Invalid session ID` on the next tool call. Restart order:
+    # droids-mem first, THEN the agentspan worker, THEN `droids-agents run`.
+    if settings is not None:
+        try:
+            r = httpx.post(
+                settings.droids_mem_mcp_url,
+                headers={
+                    "Authorization": f"Bearer {settings.droids_mem_mcp_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "doctor", "version": "1"},
+                    },
+                },
+                timeout=3.0,
+            )
+            sid = r.headers.get("Mcp-Session-Id", "")
+            ok = r.status_code == 200 and sid != ""
+            detail = (
+                f"session={sid[:20]}… minted"
+                if ok
+                else f"HTTP {r.status_code}, no Mcp-Session-Id header"
+            )
+            results.append({"name": "droids-mem MCP init", "ok": ok, "detail": detail})
+        except httpx.HTTPError as e:
+            results.append({"name": "droids-mem MCP init", "ok": False, "detail": str(e)})
 
     # 3. agentspan reachable.
     if settings is not None:

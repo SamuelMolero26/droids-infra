@@ -43,6 +43,25 @@ Optional:
 
 CLI exit codes: `0` ok, `1` runtime, `2` usage, `3` dep unreachable, `4` HITL pause, `5` cost cap hit, `10` dry-run pass. All errors emit JSON envelope on stderr in `--json` mode.
 
+## Startup-order discipline (MCP stateful transport)
+
+`droids-mem serve` uses mark3labs/mcp-go Streamable HTTP in **stateful** mode: every `initialize` mints an `Mcp-Session-Id` the client must echo on subsequent calls. Two distinct caches consume that header:
+
+- The **agentspan server** (`:6767`, Java/Conductor) — the built-in `LIST_MCP_TOOLS` task for MCP-attached Agents caches the session per workflow definition. Rollup writes now use native Python `mem_save` and avoid this path.
+- The **agentspan Python worker** (`agent-sdk`) — its MCP client cache plus a module-level circuit breaker for tool failures.
+
+If droids-mem restarts mid-Execution, BOTH hold a now-stale session id and any further MCP call returns `HTTP 404 Invalid session ID`. Stateless mode is NOT a viable workaround — the agentspan SDK's MCP HTTP transport requires the header on init handshake.
+
+Order on cold start, after any droids-mem restart, or after any binary swap:
+
+1. `droids-mem ensure-server` — start (or confirm) droids-mem on `:7777`.
+2. Restart the **agentspan server** at `:6767` so its workflow-cache re-initializes against the current droids-mem PID. This is the cache that emits `LIST_MCP_TOOLS` 404s when stale.
+3. Restart the **agentspan Python worker** (`agent-sdk`) so its MCP client AND its module-level `web_navigate` circuit breaker are fresh.
+4. `droids-agents doctor` — confirms `/healthz` + a fresh MCP `initialize` handshake from this host.
+5. `droids-agents run "<prompt>"`.
+
+If `LIST_MCP_TOOLS` surfaces `Invalid session ID` mid-run, repeat from step 2 (server is the culprit). If `web_navigate` reports `circuit breaker open`, repeat from step 3 (worker is the culprit).
+
 ## Architecture
 
 Single binary, layered Python packages. Build sequence and design locks live in `V1-droids-agents-plan.md`. Domain language in `CONTEXT.md` is authoritative — read it before renaming anything.
@@ -53,7 +72,7 @@ Layers (do not skip):
 2. **`src/router.py`** — pre-compile classification. `classify_prompt` and `plan_mixed_steps` are plain Anthropic SDK calls on `claude-haiku-4-5` BEFORE agentspan compiles the Root. agentspan workflows are static, so dynamic `mixed` SEQUENTIAL must be planned in Python first. `build_root` picks a stable name per shape (`root_single_research`, `root_mixed_research_docs`) so agentspan's compile cache hits.
 3. **`src/agents/`** — one file per Subteam (`research`, `docs`, `form`, `messaging`). Each exports a `*_team(pool, *, slice_lines, ...)` factory returning an `Agent`. Strategies: research=PARALLEL, docs=SWARM (handoff via `OnTextMention`, `max_turns=10`), form=HANDOFF, messaging=HANDOFF. Specialists run `claude-sonnet-4-6`.
 4. **`src/guardrails/`** — `Position.INPUT` / `Position.OUTPUT` validation. `OnFail` modes layered: RETRY first, then HUMAN. Files mirror Subteam names + `router.py` (jailbreak) + `docs.py` (citations). HITL has two distinct mechanisms — see below.
-5. **`src/tools/`** — `@agentspan.agents.tool` wrappers. `mem.py` exposes both the `mem_tools(settings)` MCP attachment AND a direct `fetch_mem_context` httpx call (the CLI uses the latter pre-compile). `playwright.py` owns a module-level `_browsers: dict[exec_id, BrowserContext]` registry with an asyncio.Lock; CLI registers teardown via runtime callbacks. `gmail.py`'s `_service()` never opens a browser — it loads/refreshes the token and raises `GmailAuthError` for missing/malformed/revoked cases (`auth gmail` is the only OAuth entrypoint). `files.read_doc` caps at 50k chars/doc, branches on `.pdf/.md/.txt`.
+5. **`src/tools/`** — `@agentspan.agents.tool` wrappers. `mem.py` exposes `mem_write_tools(settings)` for native Rollup `mem_save` writes, `mem_tools(settings)` for server-side MCP attachment, and direct `fetch_mem_context` httpx calls (the CLI uses the latter pre-compile). `playwright.py` uses Playwright's sync API because agentspan's tool dispatcher is synchronous; it owns a module-level `_browsers: dict[exec_id, BrowserContext]` registry guarded by `threading.RLock`. `gmail.py`'s `_service()` never opens a browser — it loads/refreshes the token and raises `GmailAuthError` for missing/malformed/revoked cases (`auth gmail` is the only OAuth entrypoint). `files.read_doc` caps at 50k chars/doc, branches on `.pdf/.md/.txt`.
 6. **`src/schemas.py`** — Pydantic models for every Sub-agent output and droids-mem payload. Sub-agents emit typed outputs; the Rollup composes them deterministically (no LLM JSON parsing).
 7. **`src/slicing.py`** — `slice_for(role, bundle, prompt)` is rule-based (no LLM). Slicing is per-Role, not per-Sub-agent; CLI builds the slice map once via `_build_slice_map`.
 8. **`src/naming.py`** — `NamePool` claims unique Droid names per Execution. `agentspan.Agent.name` stays stable (e.g. `competitor_0`) for the compile cache; Droid names live in `metadata={"droid_name": ...}` and surface only in CLI/logs.
@@ -64,7 +83,7 @@ The **Root agent is the sole reader/writer of droids-mem per Execution.** Sub-ag
 
 - The **CLI** calls `fetch_mem_context` directly via JSON-RPC BEFORE compiling Root. The minted `session_id` is captured and threaded through every subsequent `mem_save` call.
 - Subteam factories receive `slice_lines` baked into their `instructions` closure at build time. They cannot mutate or refetch.
-- Only the **Rollup agent** has `mem_tools(settings)` attached. It writes one `kind=session_summary` record per Execution.
+- Only the **Rollup agent** has memory write tools attached. It uses native Python `mem_write_tools(settings)` (fresh MCP handshake per `mem_save`) and writes bounded Rollup rows sharing the same `session_id`.
 
 Why: agentspan compiles a static `WorkflowDef` up front; an Agent-level `memory_loader` would block static composition. Also, semantic purity — schema stays at 4 kinds (no `observation`).
 

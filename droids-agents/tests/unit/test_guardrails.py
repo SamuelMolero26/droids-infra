@@ -1,11 +1,15 @@
-"""Pure-function guardrail tests. No LLM, no agentspan execution."""
+"""Pure-function guardrail tests. No LLM, no agentspan execution.
+
+Research has no guardrail module — Pydantic ``CompetitorFinding`` validators
+own length / scheme / apology checks. See ``tests/unit/test_schemas.py``.
+"""
 
 from __future__ import annotations
 
 import json
 
 import pytest
-from droids_agents.guardrails import docs, form, messaging, research, router
+from droids_agents.guardrails import docs, form, messaging, router
 
 
 def _json(**kw) -> str:
@@ -32,42 +36,6 @@ def test_no_jailbreak_rejects(bad: str) -> None:
 
 def test_no_jailbreak_accepts_normal_prompt() -> None:
     assert router.no_jailbreak("research Anthropic pricing").passed
-
-
-# --- research.findings_* --------------------------------------------------
-
-
-def test_findings_structural_rejects_missing_fields() -> None:
-    assert not research.findings_structural(_json(summary="", source_url="x")).passed
-    assert not research.findings_structural(_json(summary="x", source_url="")).passed
-
-
-def test_findings_structural_rejects_non_finding_json() -> None:
-    assert not research.findings_structural(_json(other="x")).passed
-    assert not research.findings_structural("not json").passed
-
-
-def test_findings_quality_enforces_http_scheme() -> None:
-    bad_scheme = _json(summary="x" * 60, source_url="ftp://example.com")
-    assert not research.findings_quality(bad_scheme).passed
-
-
-def test_findings_quality_enforces_min_summary_len() -> None:
-    short = _json(summary="too short", source_url="https://example.com")
-    assert not research.findings_quality(short).passed
-
-
-def test_findings_quality_rejects_apology() -> None:
-    apology = _json(
-        summary="As an AI I couldn't find data " + "x" * 40,
-        source_url="https://example.com",
-    )
-    assert not research.findings_quality(apology).passed
-
-
-def test_findings_quality_accepts_clean_output() -> None:
-    ok = _json(summary="x" * 60, source_url="https://example.com")
-    assert research.findings_quality(ok).passed
 
 
 # --- docs.citations_* ----------------------------------------------------

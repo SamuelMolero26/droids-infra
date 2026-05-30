@@ -14,9 +14,11 @@ Phase 3 will wrap N of these in a capped SessionRegistry.
 
 from __future__ import annotations
 
+import re
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from droids_agents.config import Settings
@@ -24,12 +26,11 @@ from droids_agents.execution import (
     ExecutionError,
     build_execution,
     plan_execution,
-    roles_for_steps,
 )
+from droids_agents.logging import SessionLogger
 from droids_agents.naming import NamePool
-from droids_agents.pricing import BILLING_MODEL, estimate_cost_usd
 from droids_agents.router import make_client
-from droids_agents.runtime import connect_runtime
+from droids_agents.runtime import connect_runtime, reset_tool_circuit_breakers
 
 # Status lifecycle.
 STARTING = "starting"
@@ -46,17 +47,22 @@ class SessionSnapshot:
 
     status: str
     exec_id: str
+    agentspan_url: str
     session_id: str
     steps: list[str]
     feed: list[str]
     messages: int
     tool_calls: int
     turns: int
-    agents_total: int
     agents_seen: int
-    cost_usd: float | None
     error: str | None
     final_output: Any
+    tasks_total: int = 0
+    tasks_done: int = 0
+    task_groups: dict[str, dict[str, int]] = field(default_factory=dict)
+    eta_seconds: float | None = None
+    progress_percent: float = 0.0
+    elapsed_seconds: float | None = None
 
 
 class SessionState:
@@ -67,19 +73,23 @@ class SessionState:
         self._lock = threading.Lock()
         self.status = STARTING
         self.exec_id = ""
+        self.agentspan_url = ""
         self.session_id = ""
         self.steps: list[str] = []
         self.feed: list[str] = []
         self.messages = 0
         self.tool_calls = 0
         self.turns = 0
-        self.agents_total = 0
         self._agents_seen: set[str] = set()
-        self.cost_usd: float | None = None
         self.error: str | None = None
         self.final_output: Any = None
         self._stream: Any = None  # AgentStream, once started
+        self._runtime: Any = None  # AgentRuntime, set by attach_runtime
         self._stopped = False  # set by request_stop(); loop breaks, status → CLOSED
+        self.started_at: float | None = None  # monotonic, set by attach_stream
+        self.tasks_total = 0
+        self.tasks_done = 0
+        self.task_groups: dict[str, dict[str, int]] = {}
 
     # --- runner-side mutations ---
 
@@ -94,13 +104,26 @@ class SessionState:
     def set_plan(self, steps: list[str]) -> None:
         with self._lock:
             self.steps = list(steps)
-            self.agents_total = len(roles_for_steps(steps))  # type: ignore[arg-type]
+
+    def attach_runtime(self, runtime: Any) -> None:
+        with self._lock:
+            self._runtime = runtime
 
     def attach_stream(self, stream: Any) -> None:
         with self._lock:
             self._stream = stream
             self.exec_id = getattr(getattr(stream, "handle", None), "execution_id", "") or ""
             self.status = RUNNING
+            self.started_at = time.monotonic()
+
+    def update_task_progress(
+        self, total: int, done: int, groups: dict[str, dict[str, int]]
+    ) -> None:
+        """Called by the task poller. Snapshot exposes the derived ETA."""
+        with self._lock:
+            self.tasks_total = total
+            self.tasks_done = done
+            self.task_groups = groups
 
     def request_stop(self) -> None:
         """Signal the run loop to stop and best-effort cancel the agentspan
@@ -113,13 +136,21 @@ class SessionState:
             if self.status not in (DONE, ERROR):
                 self.status = CLOSED
             stream = self._stream
-        # Call stop outside the lock — agentspan I/O may block.
+            runtime = self._runtime
+            exec_id = self.exec_id
+        # Cancel server-side execution first (covers HITL-paused workflows).
+        if runtime is not None and exec_id:
+            try:
+                runtime.cancel(exec_id, reason="user requested stop")
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        # Also stop the local stream iterator.
         for target in (getattr(stream, "handle", None), stream):
             stop = getattr(target, "stop", None)
             if callable(stop):
                 try:
                     stop()
-                except Exception:  # noqa: BLE001 — best-effort cancel
+                except Exception:  # noqa: BLE001
                     pass
                 break
 
@@ -166,9 +197,6 @@ class SessionState:
             if self.status != ERROR:
                 self.status = DONE
             self.exec_id = getattr(result, "execution_id", self.exec_id) or self.exec_id
-            tu = getattr(result, "token_usage", None)
-            if tu is not None:
-                self.cost_usd = _usd_from_tokens(tu)
             out = getattr(result, "output", None)
             if out is not None:
                 self.final_output = out
@@ -198,32 +226,41 @@ class SessionState:
 
     def snapshot(self) -> SessionSnapshot:
         with self._lock:
+            elapsed = (
+                time.monotonic() - self.started_at if self.started_at is not None else None
+            )
+            eta: float | None = None
+            percent = 0.0
+            if self.tasks_total > 0:
+                percent = min(100.0, (self.tasks_done / self.tasks_total) * 100.0)
+            if (
+                elapsed is not None
+                and self.tasks_done > 0
+                and self.tasks_total > self.tasks_done
+            ):
+                eta = (elapsed / self.tasks_done) * (self.tasks_total - self.tasks_done)
+            elif self.tasks_total > 0 and self.tasks_done >= self.tasks_total:
+                eta = 0.0
             return SessionSnapshot(
                 status=self.status,
                 exec_id=self.exec_id,
+                agentspan_url=self.agentspan_url,
                 session_id=self.session_id,
                 steps=list(self.steps),
                 feed=list(self.feed),
                 messages=self.messages,
                 tool_calls=self.tool_calls,
                 turns=self.turns,
-                agents_total=self.agents_total,
                 agents_seen=len(self._agents_seen),
-                cost_usd=self.cost_usd,
                 error=self.error,
                 final_output=self.final_output,
+                tasks_total=self.tasks_total,
+                tasks_done=self.tasks_done,
+                task_groups={k: dict(v) for k, v in self.task_groups.items()},
+                eta_seconds=eta,
+                progress_percent=percent,
+                elapsed_seconds=elapsed,
             )
-
-
-def _usd_from_tokens(token_usage: Any) -> float | None:
-    """Derive cost from agentspan TokenUsage, which only exposes
-    prompt_tokens / completion_tokens / total_tokens (no cost field, no model).
-    Price at sonnet-4-6 — conservative, since specialists run it."""
-    prompt = getattr(token_usage, "prompt_tokens", None)
-    completion = getattr(token_usage, "completion_tokens", None)
-    if not isinstance(prompt, (int, float)) or not isinstance(completion, (int, float)):
-        return None
-    return estimate_cost_usd(BILLING_MODEL, int(prompt), int(completion))
 
 
 DEFAULT_CAP = 3
@@ -265,7 +302,6 @@ class SessionRegistry:
         prompt: str,
         competitors: list[str],
         settings: Settings,
-        max_total_tokens: int | None = None,
         runner: Callable[..., None] = None,  # type: ignore[assignment]
     ) -> SessionHandle:
         runner = runner or run_session
@@ -281,7 +317,6 @@ class SessionRegistry:
             kwargs={
                 "settings": settings,
                 "competitors": competitors,
-                "max_total_tokens": max_total_tokens,
             },
             name=f"droids-agents-{key}",
             daemon=True,
@@ -311,16 +346,141 @@ class SessionRegistry:
             handle.state.request_stop()
 
 
+_TASK_REF_RE = re.compile(
+    r".+?_(?:handoff|agent|step|sequential|parallel|round_robin|router|swarm|random|manual|transfer)_(?:\d+_)?(.*)"
+)
+_TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "SKIPPED", "TIMED_OUT", "CANCELED"}
+_TERMINAL_WF_STATUSES = {"COMPLETED", "FAILED", "TERMINATED", "TIMED_OUT"}
+
+
+def _short_ref(ref: str) -> str:
+    m = _TASK_REF_RE.match(ref or "")
+    return m.group(1) if m else (ref or "child")
+
+
+def _gather_task_progress(
+    workflow_client: Any,
+    parent_exec_id: str,
+) -> tuple[int, int, dict[str, dict[str, int]]]:
+    """Walk parent workflow + one level of SUB_WORKFLOW children, summing tasks.
+
+    agentspan emits parallel/handoff topologies as SUB_WORKFLOW tasks whose
+    internal LLM/tool calls never reach the parent's task list. Following
+    ``sub_workflow_id`` once is enough for V1 (research_team PARALLEL fan-out is
+    a single nesting level). Returns (total, done, groups) where ``groups`` is
+    keyed by short ref name → {"total", "done"} for per-agent surfacing.
+    """
+    groups: dict[str, dict[str, int]] = {}
+    total = 0
+    done = 0
+
+    def add(group: str, t: int, d: int) -> None:
+        nonlocal total, done
+        g = groups.setdefault(group, {"total": 0, "done": 0})
+        g["total"] += t
+        g["done"] += d
+        total += t
+        done += d
+
+    try:
+        parent = workflow_client.get_workflow(parent_exec_id, include_tasks=True)
+    except Exception:  # noqa: BLE001 — best-effort polling, never raise
+        return 0, 0, {}
+
+    parent_tasks = list(getattr(parent, "tasks", []) or [])
+    own_t = own_d = 0
+    sub_refs: list[tuple[str, str]] = []
+
+    for t in parent_tasks:
+        ttype = str(getattr(t, "task_type", "")).upper()
+        tstatus = str(getattr(t, "status", "")).upper()
+        if "SUB_WORKFLOW" in ttype:
+            sub_id = getattr(t, "sub_workflow_id", None)
+            ref = _short_ref(getattr(t, "reference_task_name", ""))
+            if sub_id:
+                sub_refs.append((ref, sub_id))
+            else:
+                own_t += 1
+                if tstatus in _TERMINAL_TASK_STATUSES:
+                    own_d += 1
+        else:
+            own_t += 1
+            if tstatus in _TERMINAL_TASK_STATUSES:
+                own_d += 1
+    if own_t:
+        add("root", own_t, own_d)
+
+    for ref, sid in sub_refs:
+        try:
+            child = workflow_client.get_workflow(sid, include_tasks=True)
+        except Exception:  # noqa: BLE001
+            continue
+        ctasks = list(getattr(child, "tasks", []) or [])
+        ct = cd = 0
+        for t in ctasks:
+            ttype = str(getattr(t, "task_type", "")).upper()
+            tstatus = str(getattr(t, "status", "")).upper()
+            ct += 1
+            if tstatus in _TERMINAL_TASK_STATUSES:
+                cd += 1
+            # one more nesting level (e.g. nested handoff/agent_tool) — count but
+            # don't recurse deeper to keep poll cost bounded.
+            if "SUB_WORKFLOW" in ttype:
+                grand_id = getattr(t, "sub_workflow_id", None)
+                if grand_id:
+                    try:
+                        grand = workflow_client.get_workflow(grand_id, include_tasks=True)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for gt in list(getattr(grand, "tasks", []) or []):
+                        ct += 1
+                        if str(getattr(gt, "status", "")).upper() in _TERMINAL_TASK_STATUSES:
+                            cd += 1
+        if ct:
+            add(ref, ct, cd)
+
+    return total, done, groups
+
+
+def _spawn_task_poller(
+    state: SessionState,
+    workflow_client: Any,
+    interval_s: float = 1.5,
+) -> tuple[threading.Thread, threading.Event]:
+    """Start a daemon thread that refreshes task progress every ``interval_s``.
+
+    Exits when ``stop`` is set, the session is stopped, or status hits a
+    terminal state. Errors swallowed — visibility is best-effort.
+    """
+    stop = threading.Event()
+
+    def loop() -> None:
+        while not stop.is_set() and not state.stopped:
+            exec_id = state.snapshot().exec_id
+            if exec_id:
+                total, done, groups = _gather_task_progress(workflow_client, exec_id)
+                if total or groups:
+                    state.update_task_progress(total, done, groups)
+            if state.snapshot().status in (DONE, ERROR, CLOSED):
+                return
+            stop.wait(interval_s)
+
+    thread = threading.Thread(target=loop, daemon=True, name="droids-agents-task-poller")
+    thread.start()
+    return thread, stop
+
+
 def run_session(
     state: SessionState,
     *,
     settings: Settings,
     competitors: list[str],
-    max_total_tokens: int | None = None,
     runtime_factory: Callable[[Settings], Any] = connect_runtime,
 ) -> None:
     """Plan → build → stream. Mutates ``state`` as events arrive. Designed to
     run in its own thread (the stream iteration blocks)."""
+    session_logger = SessionLogger(getattr(settings, "log_dir", None))
+    poller_stop: threading.Event | None = None
     try:
         client = make_client(settings)
         plan = plan_execution(
@@ -339,18 +499,26 @@ def run_session(
             pool=pool,
             docs_basenames=[],
             session_id_override=None,
-            max_total_tokens=max_total_tokens,
         )
         with state._lock:
             state.session_id = prepared.session_id
+        session_logger.bind(prepared.session_id)
+        session_logger.log("session_started", steps=plan.steps, competitors=competitors)
 
+        with state._lock:
+            state.agentspan_url = getattr(settings, "agentspan_url", "")
+        reset_tool_circuit_breakers()
         runtime = runtime_factory(settings)
+        state.attach_runtime(runtime)
         stream = runtime.stream(
             prepared.root,
             state.prompt,
             context={"task_type_override": None, "dry_run": False},
         )
         state.attach_stream(stream)
+        wfc = getattr(runtime, "_workflow_client", None)
+        if wfc is not None:
+            _, poller_stop = _spawn_task_poller(state, wfc)
         for event in stream:
             if state.stopped:
                 return  # tab closed — stop ingesting, skip finalize
@@ -358,7 +526,14 @@ def run_session(
         if state.stopped:
             return
         state.finalize(stream.get_result())
+        session_logger.log("session_done")
     except ExecutionError as e:
+        session_logger.log("session_error", code=e.code, message=e.message)
         state.fail(e.message)
     except Exception as e:  # noqa: BLE001 — surface any runtime/stream error
+        session_logger.log("session_error", type=type(e).__name__, message=str(e))
         state.fail(f"{type(e).__name__}: {e}")
+    finally:
+        if poller_stop is not None:
+            poller_stop.set()
+        session_logger.close()

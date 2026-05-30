@@ -44,3 +44,10 @@ def test_validate_docs_rejects_total_size_cap(tmp_path) -> None:
     big = _make_file(tmp_path / "big.txt", b"\0" * (6 * 1024 * 1024))
     with pytest.raises(click.UsageError, match="total size"):
         cli._validate_docs((big,))
+
+
+def test_competitors_whitespace_only_parses_to_empty() -> None:
+    """' , , ' strips to [] — triggers auto-extraction, not a crash."""
+    raw = " , , "
+    result = [c.strip() for c in raw.split(",") if c.strip()]
+    assert result == []

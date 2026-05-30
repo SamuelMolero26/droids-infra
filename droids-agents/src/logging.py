@@ -128,3 +128,54 @@ def get_logger(*, agent_display: str | None = None) -> structlog.BoundLogger:
     if agent_display:
         log = log.bind(agent_display=agent_display)
     return log
+
+
+class SessionLogger:
+    """Per-session file logger for TUI concurrent sessions.
+
+    Narrow scope: only run_session writes to it. Writes key milestones to
+    <log_dir>/<session_id>.jsonl. No-ops silently when log_dir is None.
+    Safe to use from a worker thread; bind() may be called at most once.
+    """
+
+    def __init__(self, log_dir: Path | None) -> None:
+        self._log_dir = Path(log_dir) if log_dir else None
+        self._buffer: list[str] = []
+        self._file: Any = None
+        self._lock = threading.Lock()
+
+    def bind(self, session_id: str) -> None:
+        """Open log file and flush pre-bind buffer. Call once after session_id is known."""
+        if self._log_dir is None:
+            return
+        with self._lock:
+            log_path = self._log_dir / f"{session_id}.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = log_path.open("a", encoding="utf-8")
+            for line in self._buffer:
+                fh.write(line + "\n")
+            fh.flush()
+            self._buffer.clear()
+            self._file = fh
+
+    def log(self, event: str, **kw: Any) -> None:
+        if self._log_dir is None:
+            return
+        from datetime import UTC, datetime
+        line = json.dumps(
+            {"ts": datetime.now(UTC).isoformat(), "event": event, **kw},
+            default=str,
+        )
+        with self._lock:
+            if self._file is not None:
+                self._file.write(line + "\n")
+                self._file.flush()
+            else:
+                self._buffer.append(line)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file is not None:
+                self._file.flush()
+                self._file.close()
+                self._file = None

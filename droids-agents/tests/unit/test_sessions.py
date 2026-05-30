@@ -69,7 +69,7 @@ def test_run_session_streams_to_done(monkeypatch) -> None:
     assert snap.tool_calls == 1
     assert snap.exec_id == "exec_1"
     assert snap.session_id == "sess_x"
-    assert snap.agents_total == 1  # roles_for_steps(["research"]) == ["competitor"]
+    assert snap.agents_seen == 0  # no handoff events in this stream
 
 
 def test_run_session_error_event(monkeypatch) -> None:
@@ -121,7 +121,7 @@ def test_send_without_stream_returns_false() -> None:
 from droids_agents.sessions import RegistryFull, SessionRegistry  # noqa: E402
 
 
-def _noop_runner(state, *, settings, competitors, max_total_tokens):
+def _noop_runner(state, *, settings, competitors):
     state.note("ran")
     state.status = DONE
 

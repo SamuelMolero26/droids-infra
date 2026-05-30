@@ -19,7 +19,7 @@ Layers:
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from anthropic import Anthropic
@@ -191,7 +191,6 @@ def build_execution(
     pool: NamePool,
     docs_basenames: list[str],
     session_id_override: str | None,
-    max_total_tokens: int | None,
     fetch_context: Callable[..., MemoryLoaderResult] = fetch_mem_context,
 ) -> PreparedExecution:
     """Fetch Bundle, cut Slices, build the Root agent. Raises MemUnreachable
@@ -212,7 +211,6 @@ def build_execution(
         competitors=plan.competitors,
         docs_basenames=docs_basenames,
         slice_map=slice_map,
-        max_total_tokens=max_total_tokens,
     )
     return PreparedExecution(
         plan=plan,
@@ -237,37 +235,21 @@ def _result_get(result: Any, *names: str, default: Any = None) -> Any:
 
 @dataclass
 class Outcome:
-    kind: str  # "hitl" | "dry_run" | "cost_cap" | "ok"
+    kind: str  # "dry_run" | "ok"
     exec_id: str
     output: Any = None
-    hitl: dict[str, Any] = field(default_factory=dict)
-    termination_reason: str = ""
 
 
 def interpret_result(result: Any, *, dry_run: bool) -> Outcome:
-    """Classify an agentspan run result into a surface-independent Outcome."""
+    """Classify an agentspan run result into a surface-independent Outcome.
+
+    HITL is detected upstream via EventType.WAITING in the stream loop (cli.py).
+    Cost cap removed with pricing module.
+    """
     exec_id = _result_get(result, "execution_id", "exec_id", default="<unknown>")
-
-    if _result_get(result, "is_waiting", default=False):
-        pending = _result_get(result, "pending_approval", "waiting_for", default={})
-        if not isinstance(pending, dict):
-            pending = {}
-        return Outcome(kind="hitl", exec_id=exec_id, hitl=pending)
-
     output = _result_get(result, "output", default={})
     if hasattr(output, "model_dump"):
         output = output.model_dump()
-
     if dry_run:
         return Outcome(kind="dry_run", exec_id=exec_id, output=output)
-
-    termination_reason = _result_get(result, "termination_reason", default="")
-    if "token" in str(termination_reason).lower():
-        return Outcome(
-            kind="cost_cap",
-            exec_id=exec_id,
-            output=output,
-            termination_reason=str(termination_reason),
-        )
-
     return Outcome(kind="ok", exec_id=exec_id, output=output)
